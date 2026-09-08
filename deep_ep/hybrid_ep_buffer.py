@@ -46,6 +46,15 @@ def dense_indices_to_probs(
     num_of_tokens: int,
     num_of_experts: int,
 ):
+    if (topk_idx.is_cuda and topk_idx.dtype in (torch.int32, torch.int64)
+            and topk_weights.dtype == torch.float32
+            and not (torch.is_grad_enabled() and topk_weights.requires_grad)
+            and topk_weights.device == topk_idx.device
+            and topk_idx.ndim == 2 and topk_weights.shape == topk_idx.shape
+            and topk_idx.size(0) == num_of_tokens and topk_idx.size(1) <= 32
+            and 0 < num_of_experts <= 1024
+            and topk_idx.is_contiguous() and topk_weights.is_contiguous()):
+        return hybrid_ep_cpp.dense_topk_probs(topk_idx, topk_weights, num_of_experts)
     probs = torch.zeros(
         num_of_tokens, num_of_experts, device=topk_idx.device, dtype=torch.float32
     )
@@ -171,6 +180,7 @@ class HybridEPBuffer:
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         num_of_experts_per_rank: int = None,
+        cached: bool = False,
     ):
         if routing_map is not None:
             assert routing_map.dtype == torch.bool
@@ -192,6 +202,14 @@ class HybridEPBuffer:
         )
         if probs is not None:
             assert probs.size(0) == num_of_tokens and probs.size(-1) == num_of_experts
+
+        if cached:
+            # The handle owns routing metadata, but probabilities may change.
+            if probs is None and topk_weights is not None:
+                probs = dense_indices_to_probs(
+                    topk_idx, topk_weights, num_of_tokens, num_of_experts
+                )
+            return 0, None, probs, num_of_experts
 
         topk = topk_idx.size(-1)
         if self._use_dense_topk_routing(num_of_experts, num_of_experts_per_rank):
@@ -300,6 +318,7 @@ class HybridEPBuffer:
             num_of_experts=num_of_experts,
             probs=probs,
             routing_map=routing_map,
+            cached=handle is not None,
         )
 
         assert (
@@ -318,6 +337,9 @@ class HybridEPBuffer:
                 enable_permute=False,
                 non_blocking=False,
             )
+            # The count lives in CPU pinned memory. Tensor.item() on it does
+            # not wait for the GPU writer; wait once when creating the handle.
+            torch.cuda.current_stream().synchronize()
         else:
             # Convert legacy tuple to HandleImpl
             handle_impl = hybrid_ep_cpp.HandleImpl()
@@ -330,10 +352,6 @@ class HybridEPBuffer:
                 handle_impl.num_of_tokens_per_rank,
                 handle_impl.config,
             ) = handle
-
-        if num_dispatched_tokens is None:
-            # Synchronize the stream to make sure the data in the pinned_memory_buffer: num_dispatched_tokens_tensor is ready.
-            torch.cuda.current_stream().synchronize()
 
         dispatched_token, dispatched_probs, dispatched_scaling_factor = (
             self.runtime.dispatch(
@@ -448,6 +466,7 @@ class HybridEPBuffer:
                 probs=probs,
                 routing_map=routing_map,
                 num_of_experts_per_rank=num_of_experts_per_rank,
+                cached=handle is not None,
             )
             if non_blocking:
                 assert num_permuted_tokens is not None and num_permuted_tokens >= 0, \

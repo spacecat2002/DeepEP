@@ -6,6 +6,9 @@
 #include <cuda_bf16.h>
 #include <torch/torch.h>
 #include "utils.cuh"
+
+torch::Tensor dense_topk_probs(torch::Tensor indices, torch::Tensor weights,
+                              int64_t num_experts);
  
 struct PermuteArgs {
   // The address of the input 

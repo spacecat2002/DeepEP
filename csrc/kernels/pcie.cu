@@ -128,7 +128,7 @@ notify_dispatch_pcie(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
             // Iterate over tokens
             int per_rank_count = 0;
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
-                per_rank_count += is_token_in_rank[i * kNumRanks + dst_rank];
+                per_rank_count += __ldg(reinterpret_cast<const unsigned char*>(is_token_in_rank + i * kNumRanks + dst_rank));
             }
             per_rank_count = warp_reduce_sum(per_rank_count);
             // Write into channel matrix

@@ -8,6 +8,20 @@ namespace deep_ep {
 
 namespace intranode {
 
+template <int kNumRanks>
+__device__ __forceinline__ void load_rank_bits(const bool* row, uint64_t (&bits)[2]) {
+    if constexpr (kNumRanks == 2)
+        bits[0] = __ldg(reinterpret_cast<const uint16_t*>(row));
+    else if constexpr (kNumRanks == 4)
+        bits[0] = __ldg(reinterpret_cast<const uint32_t*>(row));
+    else if constexpr (kNumRanks == 8)
+        bits[0] = __ldg(reinterpret_cast<const uint64_t*>(row));
+    else {
+        bits[0] = __ldg(reinterpret_cast<const uint64_t*>(row));
+        bits[1] = __ldg(reinterpret_cast<const uint64_t*>(row + 8));
+    }
+}
+
 template<int kNumRanks>
 __global__ void
 notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
@@ -64,8 +78,6 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
-        __syncthreads();
-
         // Copy rank size prefix matrix to another tensor
         #pragma unroll
         for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
@@ -79,27 +91,42 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
     } else {
-        int dst_rank = sm_id - 1;
-        for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
+        int channel_id = (sm_id - 1) * num_warps + warp_id;
+        if (channel_id < num_channels) {
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-            // Iterate over tokens
-            int count = 0;
-            for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32)
-                count += is_token_in_rank[i * kNumRanks + dst_rank];
-            count = warp_reduce_sum(count);
-            if (elect_one_sync())
-                channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
-        }
-        __syncthreads();
+            // Iterate over tokens once, accumulating all destination ranks.
+            int counts[kNumRanks] = {0};
+            for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
+                uint64_t bits[2];
+                load_rank_bits<kNumRanks>(is_token_in_rank + i * kNumRanks, bits);
+                #pragma unroll
+                for (int dst_rank = 0; dst_rank < kNumRanks; ++dst_rank)
+                    counts[dst_rank] += (bits[dst_rank / 8] >> ((dst_rank % 8) * 8)) & 0xff;
+            }
 
-        // Pre-compute prefix sum for all channels
-        if (thread_id == 0) {
             #pragma unroll
-            for (int i = 1; i < num_channels; ++ i)
-                channel_prefix_matrix[dst_rank * num_channels + i] += channel_prefix_matrix[dst_rank * num_channels + i - 1];
+            for (int dst_rank = 0; dst_rank < kNumRanks; ++dst_rank)
+                counts[dst_rank] = warp_reduce_sum(counts[dst_rank]);
+            if (elect_one_sync()) {
+                #pragma unroll
+                for (int dst_rank = 0; dst_rank < kNumRanks; ++dst_rank)
+                    channel_prefix_matrix[dst_rank * num_channels + channel_id] = counts[dst_rank];
+            }
         }
+    }
+}
+
+template <int kNumRanks>
+__global__ void
+prefix_sum(int* channel_prefix_matrix, int num_channels) {
+    auto rank = static_cast<int>(threadIdx.x);
+    if (rank < kNumRanks) {
+        auto prefix_row = channel_prefix_matrix + rank * num_channels;
+        #pragma unroll
+        for (int i = 1; i < num_channels; ++i)
+            prefix_row[i] += prefix_row[i - 1];
     }
 }
 
@@ -116,13 +143,15 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
         num_tokens, num_channels, is_token_in_rank, channel_prefix_matrix, \
         rank_prefix_matrix_copy, num_memset_int, expert_alignment, \
         buffer_ptrs, barrier_signal_ptrs, rank); \
+    LAUNCH_KERNEL(&prefix_cfg, prefix_sum<ranks>, channel_prefix_matrix, num_channels); \
     break
 
     constexpr int kNumThreads = 128;
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads);
 
-    SETUP_LAUNCH_CONFIG(1 + num_ranks, kNumThreads, stream);
+    SETUP_LAUNCH_CONFIG(1 + (num_channels + kNumThreads / 32 - 1) / (kNumThreads / 32), kNumThreads, stream);
+    cudaLaunchConfig_t prefix_cfg = {dim3(1), dim3(kNumThreads), 0, stream, nullptr, 0};
     SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
 #undef NOTIFY_DISPATCH_LAUNCH_CASE
 }

@@ -435,6 +435,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                            int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
                            int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
                            std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
+#ifndef DISABLE_NVSHMEM
+    pybind11::gil_scoped_release release;
+#endif
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.

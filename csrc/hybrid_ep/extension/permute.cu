@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdint>
 #include <type_traits>
+#include <c10/cuda/CUDAGuard.h>
 
 template void permute_launcher<uint16_t, float, float>(PermuteArgs args);
 template void permute_launcher<uint8_t, float, float>(PermuteArgs args);
@@ -42,6 +43,58 @@ __device__ __forceinline__ void store_float4_cg(float4* __restrict__ ptr, float4
 }
 
 }  // namespace
+
+template <typename Index>
+__global__ void dense_topk_probs_kernel(const Index* indices, const float* weights,
+                                       float* probs, int topk, int num_experts) {
+  __shared__ Index expert_ids[32];
+  __shared__ float expert_weights[32];
+  const int lane = threadIdx.x;
+  const int64_t row = blockIdx.x;
+  if (lane < topk) {
+    expert_ids[lane] = indices[row * topk + lane];
+    expert_weights[lane] = weights[row * topk + lane];
+  }
+  __syncthreads();
+  for (int expert = lane; expert < num_experts; expert += blockDim.x) {
+    float value = 0.0f;
+    for (int k = 0; k < topk; ++k) {
+      if (expert_ids[k] == expert)
+        value += expert_weights[k];
+    }
+    probs[row * num_experts + expert] = value;
+  }
+}
+
+torch::Tensor dense_topk_probs(torch::Tensor indices, torch::Tensor weights,
+                              int64_t num_experts) {
+  TORCH_CHECK(indices.is_cuda() && weights.device() == indices.device(),
+              "indices and weights must be on the same CUDA device");
+  TORCH_CHECK(indices.dim() == 2 && indices.sizes() == weights.sizes(),
+              "indices and weights must have matching [tokens, topk] shapes");
+  TORCH_CHECK(indices.is_contiguous() && weights.is_contiguous(),
+              "indices and weights must be contiguous");
+  TORCH_CHECK((indices.scalar_type() == torch::kInt64 || indices.scalar_type() == torch::kInt32)
+              && weights.scalar_type() == torch::kFloat32,
+              "expected int32/int64 indices and float32 weights");
+  TORCH_CHECK(indices.size(1) <= 32 && num_experts > 0 && num_experts <= 1024,
+              "expected topk <= 32 and 0 < num_experts <= 1024");
+  const c10::cuda::CUDAGuard guard(indices.device());
+  auto probs = torch::empty({indices.size(0), num_experts}, weights.options());
+  if (indices.size(0) == 0) return probs;
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (indices.scalar_type() == torch::kInt64) {
+    dense_topk_probs_kernel<<<indices.size(0), 256, 0, stream>>>(
+        indices.data_ptr<int64_t>(), weights.data_ptr<float>(), probs.data_ptr<float>(),
+        static_cast<int>(indices.size(1)), static_cast<int>(num_experts));
+  } else {
+    dense_topk_probs_kernel<<<indices.size(0), 256, 0, stream>>>(
+        indices.data_ptr<int32_t>(), weights.data_ptr<float>(), probs.data_ptr<float>(),
+        static_cast<int>(indices.size(1)), static_cast<int>(num_experts));
+  }
+  CUDA_CHECK(cudaGetLastError());
+  return probs;
+}
 
 __global__ void pad_tokens_per_expert_kernel(const int32_t* src, int64_t* dst,
                                              int num_experts, int pad_multiple) {
