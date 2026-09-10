@@ -97,6 +97,11 @@ if __name__ == '__main__':
     # `128,2417` is used to suppress warnings of `fmt`
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
+    test_variant = os.getenv('DEEPEP_TEST_VARIANT')
+    if test_variant:
+        assert test_variant == 'REMOTE_DIRECT'
+        cxx_flags.append(f'-DDEEPEP_TEST_{test_variant}')
+        nvcc_flags.append(f'-DDEEPEP_TEST_{test_variant}')
     sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
     include_dirs = [f'{current_dir}/deep_ep/include',
                     f'{current_dir}/third-party/fmt/include',

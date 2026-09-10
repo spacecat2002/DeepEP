@@ -355,7 +355,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
                 // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the
                 // following data
-                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
+                if (send_head != nullptr and token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
                     send_head[token_idx * kNumRanks + responsible_rank] =
                         is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
 
@@ -370,11 +370,20 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 if (cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank) {
                     // Copy data
                     auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
+#ifdef DEEPEP_TEST_REMOTE_DIRECT
+                    {
+                        auto rank_prefix = static_cast<int*>(buffer_ptrs[responsible_rank]);
+                        int rank_start = rank > 0 ? rank_prefix[(rank - 1) * kNumRanks + responsible_rank] : 0;
+                        int channel_start = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
+                        auto output = reinterpret_cast<int4*>(static_cast<uint8_t*>(buffer_ptrs[responsible_rank]) + (1LL << 30));
+                        shifted_channel_x_buffers = output + static_cast<int64_t>(rank_start + channel_start + cached_channel_tail_idx - 1) * hidden_int4;
+                    }
+#endif
                     auto shifted_x = x + token_idx * hidden_int4;
                     UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
 
                     // Copy source index
-                    if (elect_one_sync())
+                    if (recv_src_idx != nullptr and elect_one_sync())
                         channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
@@ -432,7 +441,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
                 ;
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
-            if (recv_warp_id_in_rank == 0)
+            if (recv_channel_offset != nullptr and recv_warp_id_in_rank == 0)
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
         }
@@ -473,6 +482,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < num_recv_tokens; chunk_idx += num_recv_warps_per_rank) {
+#ifdef DEEPEP_TEST_REMOTE_DIRECT
+                continue;
+#endif
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
                 auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4;
                 auto shifted_recv_x_int4 = recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
@@ -494,11 +506,13 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             }
 
             // Copy `src_idx`
-            #pragma unroll 4
-            for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank; chunk_idx < cached_channel_tail_idx;
-                 chunk_idx += 32 * num_recv_warps_per_rank)
-                recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] =
-                    ld_nc_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
+            if (recv_src_idx != nullptr) {
+                #pragma unroll 4
+                for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank; chunk_idx < cached_channel_tail_idx;
+                     chunk_idx += 32 * num_recv_warps_per_rank)
+                    recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] =
+                        ld_nc_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
+            }
 
             // Copy `topk_idx` and `topk_weights`
             #pragma unroll 4

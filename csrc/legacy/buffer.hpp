@@ -410,9 +410,9 @@ public:
                std::vector<int>,
                torch::Tensor,
                torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     intranode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,
@@ -601,11 +601,22 @@ public:
 
         // Allocate new tensors
         auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
-        auto recv_src_idx = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
+#ifdef DEEPEP_TEST_REMOTE_DIRECT
+        // Experimental borrowed output: valid only until the next dispatch or buffer destruction.
+        constexpr int64_t direct_offset = 1LL << 30;
+        EP_HOST_ASSERT(direct_offset + static_cast<int64_t>(num_recv_tokens) * hidden * x.element_size() <= num_nvl_bytes);
+        recv_x = torch::from_blob(static_cast<uint8_t*>(buffer_ptrs[rank]) + direct_offset, {num_recv_tokens, hidden}, x.options());
+#endif
+        auto recv_src_idx = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(),
              recv_x_scales = std::optional<torch::Tensor>();
-        auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
-        auto send_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+        auto recv_channel_prefix_matrix = std::optional<torch::Tensor>();
+        auto send_head = std::optional<torch::Tensor>();
+        if (not cached_mode) {
+            recv_src_idx = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
+            recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
+            send_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+        }
 
         // Assign pointers
         topk_idx_t* recv_topk_idx_ptr = nullptr;
@@ -634,14 +645,18 @@ public:
                 num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +   // Top-k index buffer
                 num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
                 num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
+#ifdef DEEPEP_TEST_REMOTE_DIRECT
+            <= direct_offset);
+#else
             <= num_nvl_bytes);
+#endif
         intranode::dispatch(recv_x.data_ptr(),
                             recv_x_scales_ptr,
-                            recv_src_idx.data_ptr<int>(),
+                            cached_mode ? nullptr : recv_src_idx->data_ptr<int>(),
                             recv_topk_idx_ptr,
                             recv_topk_weights_ptr,
-                            recv_channel_prefix_matrix.data_ptr<int>(),
-                            send_head.data_ptr<int>(),
+                            cached_mode ? nullptr : recv_channel_prefix_matrix->data_ptr<int>(),
+                            cached_mode ? nullptr : send_head->data_ptr<int>(),
                             x.data_ptr(),
                             x_scales_ptr,
                             topk_idx_ptr,
@@ -672,15 +687,15 @@ public:
                             is_token_in_rank,
                             rank_prefix_matrix,
                             channel_prefix_matrix,
-                            recv_x,
-                            recv_src_idx,
-                            recv_channel_prefix_matrix,
-                            send_head}) {
+                            recv_x}) {
                 t.record_stream(comm_stream);
                 if (allocate_on_comm_stream)
                     t.record_stream(compute_stream);
             }
             for (auto& to : {x_scales,
+                             recv_src_idx,
+                             recv_channel_prefix_matrix,
+                             send_head,
                              topk_idx,
                              topk_weights,
                              num_tokens_per_rank,

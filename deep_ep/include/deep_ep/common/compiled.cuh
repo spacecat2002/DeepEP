@@ -52,7 +52,7 @@ __device__ __forceinline__ longlong4_t make_longlong4_t(
 #endif
 
 #ifndef EP_NUM_TOPK_IDX_BITS
-#define EP_NUM_TOPK_IDX_BITS 64
+#define EP_NUM_TOPK_IDX_BITS 32
 #endif
 
 namespace deep_ep {
