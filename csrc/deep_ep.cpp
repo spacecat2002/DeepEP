@@ -231,6 +231,36 @@ int Buffer::get_rdma_rank() const {
     return rdma_rank;
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+Buffer::deepgemm_permute_bf16(const torch::Tensor& recv_x,
+                              const torch::Tensor& recv_topk_idx,
+                              int64_t num_output_tokens, int num_local_experts,
+                              bool deterministic) {
+    EP_HOST_ASSERT(recv_x.is_cuda() && recv_x.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(recv_x.dim() == 2 && recv_x.is_contiguous());
+    EP_HOST_ASSERT(recv_topk_idx.is_cuda() && recv_topk_idx.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(recv_topk_idx.dim() == 2 && recv_topk_idx.is_contiguous());
+    EP_HOST_ASSERT(recv_topk_idx.size(0) == recv_x.size(0));
+    EP_HOST_ASSERT(0 < num_local_experts && num_local_experts <= NUM_MAX_LOCAL_EXPERTS);
+
+    auto output = deterministic
+        ? torch::zeros({num_output_tokens, recv_x.size(1)}, recv_x.options())
+        : torch::empty({num_output_tokens, recv_x.size(1)}, recv_x.options());
+    auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(recv_x.device());
+    auto m_indices = torch::empty({num_output_tokens}, int_options);
+    auto output_index = torch::empty(recv_topk_idx.sizes(), recv_topk_idx.options());
+    auto expert_start_loc = torch::empty({num_local_experts}, int_options);
+
+    intranode::deepgemm_permute_bf16(
+        recv_x.data_ptr(), recv_topk_idx.data_ptr<int64_t>(),
+        moe_recv_expert_counter_mapped, output.data_ptr(), m_indices.data_ptr<int>(),
+        output_index.data_ptr<int64_t>(), expert_start_loc.data_ptr<int>(),
+        static_cast<int>(recv_x.size(0)), static_cast<int>(recv_x.size(1)),
+        static_cast<int>(recv_topk_idx.size(1)), num_local_experts,
+        at::cuda::getCurrentCUDAStream());
+    return {output, m_indices, output_index};
+}
+
 int Buffer::get_root_rdma_rank(bool global) const {
     return global ? nvl_rank : 0;
 }
@@ -1935,6 +1965,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
         .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
+        .def("deepgemm_permute_bf16", &deep_ep::Buffer::deepgemm_permute_bf16)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)

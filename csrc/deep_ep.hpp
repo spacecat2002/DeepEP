@@ -142,6 +142,12 @@ public:
 
     torch::Stream get_comm_stream() const;
 
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+    deepgemm_permute_bf16(const torch::Tensor& recv_x,
+                          const torch::Tensor& recv_topk_idx,
+                          int64_t num_output_tokens, int num_local_experts,
+                          bool deterministic);
+
     void sync(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles, const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
     void destroy();

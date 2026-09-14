@@ -170,6 +170,15 @@ class Buffer:
         """
         return EventOverlap(EventHandle())
 
+    def deepgemm_permute_bf16(self, recv_x: torch.Tensor,
+                              recv_topk_idx: torch.Tensor,
+                              num_output_tokens: int,
+                              num_local_experts: int,
+                              deterministic: bool = False):
+        return self.runtime.deepgemm_permute_bf16(
+            recv_x, recv_topk_idx, num_output_tokens, num_local_experts,
+            deterministic)
+
     @staticmethod
     def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
         """

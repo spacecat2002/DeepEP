@@ -156,6 +156,62 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
 #undef NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
+__global__ void deepgemm_init_layout(const int* num_recv_tokens_per_expert,
+                                     int* expert_start_loc, int* m_indices) {
+    const int expert = static_cast<int>(blockIdx.x);
+    int start = 0;
+    for (int i = 0; i < expert; ++i)
+        start += num_recv_tokens_per_expert[i];
+    const int count = num_recv_tokens_per_expert[expert];
+    if (threadIdx.x == 0)
+        expert_start_loc[expert] = start;
+    for (int i = static_cast<int>(threadIdx.x); i < count;
+         i += static_cast<int>(blockDim.x))
+        m_indices[start + i] = expert;
+}
+
+__global__ void deepgemm_scatter_bf16(const int4* recv_x,
+                                      const int64_t* recv_topk_idx,
+                                      int4* output, int64_t* output_index,
+                                      int* expert_start_loc, int hidden_int4,
+                                      int num_topk) {
+    const int token = static_cast<int>(blockIdx.x);
+    __shared__ int dst;
+    for (int k = 0; k < num_topk; ++k) {
+        if (threadIdx.x == 0) {
+            const int64_t expert = recv_topk_idx[token * num_topk + k];
+            dst = expert >= 0 ? atomicAdd(expert_start_loc + expert, 1) : -1;
+            output_index[token * num_topk + k] = dst;
+        }
+        __syncthreads();
+        if (dst >= 0) {
+            for (int i = static_cast<int>(threadIdx.x); i < hidden_int4;
+                 i += static_cast<int>(blockDim.x))
+                output[dst * hidden_int4 + i] = recv_x[token * hidden_int4 + i];
+        }
+        __syncthreads();
+    }
+}
+
+void deepgemm_permute_bf16(const void* recv_x, const int64_t* recv_topk_idx,
+                           const int* num_recv_tokens_per_expert,
+                           void* output, int* m_indices, int64_t* output_index,
+                           int* expert_start_loc, int num_tokens, int hidden,
+                           int num_topk, int num_experts, cudaStream_t stream) {
+    EP_HOST_ASSERT(hidden * 2 % sizeof(int4) == 0);
+    CUDA_CHECK(cudaMemsetAsync(output_index, 0xff,
+                               static_cast<size_t>(num_tokens) * num_topk * sizeof(int64_t),
+                               stream));
+    deepgemm_init_layout<<<num_experts, 128, 0, stream>>>(
+        num_recv_tokens_per_expert, expert_start_loc, m_indices);
+    if (num_tokens > 0) {
+        deepgemm_scatter_bf16<<<num_tokens, 256, 0, stream>>>(
+            static_cast<const int4*>(recv_x), recv_topk_idx,
+            static_cast<int4*>(output), output_index, expert_start_loc,
+            hidden * 2 / sizeof(int4), num_topk);
+    }
+}
+
 template<int kNumRanks>
 __global__ void
 cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,

@@ -76,6 +76,12 @@ void combine(cudaDataType_t type,
              cudaStream_t stream, int num_sms,
              int num_max_send_tokens, int num_recv_buffer_tokens);
 
+void deepgemm_permute_bf16(const void* recv_x, const int64_t* recv_topk_idx,
+                           const int* num_recv_tokens_per_expert,
+                           void* output, int* m_indices, int64_t* output_index,
+                           int* expert_start_loc, int num_tokens, int hidden,
+                           int num_topk, int num_experts, cudaStream_t stream);
+
 } // namespace intranode
 
 // Internode kernels
