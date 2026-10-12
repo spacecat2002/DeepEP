@@ -172,11 +172,12 @@ class Buffer:
 
     def deepgemm_permute_bf16(self, recv_x: torch.Tensor,
                               recv_topk_idx: torch.Tensor,
+                              num_recv_tokens_per_expert: torch.Tensor,
                               num_output_tokens: int,
-                              num_local_experts: int,
                               deterministic: bool = False):
         return self.runtime.deepgemm_permute_bf16(
-            recv_x, recv_topk_idx, num_output_tokens, num_local_experts,
+            recv_x, recv_topk_idx, num_recv_tokens_per_expert,
+            num_output_tokens,
             deterministic)
 
     @staticmethod
@@ -213,7 +214,7 @@ class Buffer:
         Argument:
             dtype: the data type (PyTorch `dtype`) for the tensor.
             size: the slice size (by elements) to get from the buffer.
-            offset: the offset of the beginning element.
+            offset: byte offset of the beginning of the view; must align to dtype.
             use_rdma_buffer: whether to return the RDMA buffer.
         """
         tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)

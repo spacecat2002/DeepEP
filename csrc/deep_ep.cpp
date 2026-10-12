@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
 #include <chrono>
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <memory>
 #include <pybind11/functional.h>
@@ -234,13 +235,19 @@ int Buffer::get_rdma_rank() const {
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 Buffer::deepgemm_permute_bf16(const torch::Tensor& recv_x,
                               const torch::Tensor& recv_topk_idx,
-                              int64_t num_output_tokens, int num_local_experts,
+                              const torch::Tensor& num_recv_tokens_per_expert,
+                              int64_t num_output_tokens,
                               bool deterministic) {
     EP_HOST_ASSERT(recv_x.is_cuda() && recv_x.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(recv_x.dim() == 2 && recv_x.is_contiguous());
     EP_HOST_ASSERT(recv_topk_idx.is_cuda() && recv_topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(recv_topk_idx.dim() == 2 && recv_topk_idx.is_contiguous());
     EP_HOST_ASSERT(recv_topk_idx.size(0) == recv_x.size(0));
+    EP_HOST_ASSERT(num_recv_tokens_per_expert.is_cuda() &&
+                   num_recv_tokens_per_expert.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(num_recv_tokens_per_expert.dim() == 1 &&
+                   num_recv_tokens_per_expert.is_contiguous());
+    const auto num_local_experts = static_cast<int>(num_recv_tokens_per_expert.numel());
     EP_HOST_ASSERT(0 < num_local_experts && num_local_experts <= NUM_MAX_LOCAL_EXPERTS);
 
     auto output = deterministic
@@ -253,7 +260,7 @@ Buffer::deepgemm_permute_bf16(const torch::Tensor& recv_x,
 
     intranode::deepgemm_permute_bf16(
         recv_x.data_ptr(), recv_topk_idx.data_ptr<int64_t>(),
-        moe_recv_expert_counter_mapped, output.data_ptr(), m_indices.data_ptr<int>(),
+        num_recv_tokens_per_expert.data_ptr<int>(), output.data_ptr(), m_indices.data_ptr<int>(),
         output_index.data_ptr<int64_t>(), expert_start_loc.data_ptr<int>(),
         static_cast<int>(recv_x.size(0)), static_cast<int>(recv_x.size(1)),
         static_cast<int>(recv_topk_idx.size(1)), num_local_experts,
@@ -287,9 +294,15 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
     torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
     auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
-    auto base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
     auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
-    return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
+    TORCH_CHECK(offset >= 0 && offset <= num_bytes,
+                "DeepEP buffer offset must be within [0, capacity_bytes]");
+    TORCH_CHECK(offset % element_bytes == 0,
+                "DeepEP buffer offset must align to the requested dtype");
+    auto base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
+    // An offset view owns only the remaining range, not the original capacity.
+    return torch::from_blob(base_ptr, (num_bytes - offset) / element_bytes,
+                            torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
 torch::Stream Buffer::get_comm_stream() const {
@@ -642,8 +655,19 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                     break;
 
                 // Timeout check
-                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() > NUM_CPU_TIMEOUT_SECS)
+                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() > NUM_CPU_TIMEOUT_SECS) {
+                    const auto stream_status = cudaStreamQuery(comm_stream);
+                    std::fprintf(stderr,
+                                 "DeepEP dispatch CPU timeout: rank=%d recv=%d stream=%s experts=",
+                                 rank, num_recv_tokens, cudaGetErrorString(stream_status));
+                    for (int i = 0; i < num_local_experts; ++i) {
+                        std::fprintf(stderr, "%s%d:%d", i == 0 ? "" : ",",
+                                     i, moe_recv_expert_counter[i]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
                     throw std::runtime_error("DeepEP error: CPU recv timeout");
+                }
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }

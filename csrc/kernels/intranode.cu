@@ -78,6 +78,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
+        // Publish prefix columns and finish expert reads before copy/queue clearing.
+        __syncthreads();
+
         // Copy rank size prefix matrix to another tensor
         #pragma unroll
         for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
@@ -246,7 +249,7 @@ void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseTMA = true>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
          int* send_head, const int4* x, const float* x_scales, const float* sf_scale_for_nvfp4, const int64_t* topk_idx, const float* topk_weights,
@@ -315,12 +318,15 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + half_hidden_bytes);
     uint32_t tma_phase = 0;
-    if (elect_one_sync()) {
-        mbarrier_init(tma_mbarrier, 1);
-        fence_barrier_init();
+    if constexpr (kUseTMA) {
+        // Validate the complete warp slice before initializing its barrier.
         EP_DEVICE_ASSERT(hidden_int4 % 2 == 0 and half_hidden_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        if (elect_one_sync()) {
+            mbarrier_init(tma_mbarrier, 1);
+            fence_barrier_init();
+        }
+        __syncwarp();
     }
-    __syncwarp();
 #endif
 
     if (is_sender) {
@@ -494,21 +500,25 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4;
                 auto shifted_recv_x_int4 = recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
 #ifndef DISABLE_SM90_FEATURES
-                #pragma unroll
-                for (int i = 0; i < 2; ++ i) {
-                    tma_store_wait<0>();
-                    if (elect_one_sync()) {
-                        tma_load_1d(tma_buffer, shifted_buffer_x_int4 + i * half_hidden_int4, tma_mbarrier, half_hidden_bytes);
-                        mbarrier_arrive_and_expect_tx(tma_mbarrier, half_hidden_bytes);
-                        mbarrier_wait(tma_mbarrier, tma_phase);
-                        tma_store_1d(tma_buffer, shifted_recv_x_int4 + i * half_hidden_int4, half_hidden_bytes, false);
+                if constexpr (kUseTMA) {
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++ i) {
+                        tma_store_wait<0>();
+                        if (elect_one_sync()) {
+                            tma_load_1d(tma_buffer, shifted_buffer_x_int4 + i * half_hidden_int4, tma_mbarrier, half_hidden_bytes);
+                            mbarrier_arrive_and_expect_tx(tma_mbarrier, half_hidden_bytes);
+                            mbarrier_wait(tma_mbarrier, tma_phase);
+                            tma_store_1d(tma_buffer, shifted_recv_x_int4 + i * half_hidden_int4, half_hidden_bytes, false);
+                        }
                     }
-                }
-                __syncwarp();
-#else
-                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4,
-                                   ld_nc_global, st_na_global);
+                    __syncwarp();
+                } else
 #endif
+                {
+                    // Valid int4 rows that cannot fit the TMA slice use the existing warp copy.
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4,
+                                       ld_nc_global, st_na_global);
+                }
             }
 
             // Copy `src_idx`
@@ -579,6 +589,8 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
               cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 8192;
+    const bool use_tma = hidden_int4 % 2 == 0 &&
+        static_cast<int64_t>(hidden_int4 / 2) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
@@ -588,7 +600,7 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
     EP_HOST_ASSERT(static_cast<int64_t>(num_sf_scales_for_nvfp4) * sf_scale_for_nvfp4_hidden_stride < std::numeric_limits<int>::max());
 
 #define DISPATCH_LAUNCH_CASE(ranks) { \
-    auto kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>; \
+    auto kernel = use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false>; \
     SET_SHARED_MEMORY_FOR_TMA(kernel); \
     LAUNCH_KERNEL(&cfg, kernel, \
         reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
@@ -875,7 +887,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = clock64();
-                while (__any_sync(0xffffffff, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
+                // Non-rank lanes keep expected_head=-1; guard their tail reads.
+                while (__any_sync(0xffffffff, expected_head >= 0 and channel_tail_idx[lane_id] <= expected_head)) {
                     // Timeout check
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n", rank, responsible_channel, expected_head);
