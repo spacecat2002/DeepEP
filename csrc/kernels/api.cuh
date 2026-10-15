@@ -8,6 +8,14 @@ namespace deep_ep {
 // Intranode runtime
 namespace intranode {
 
+void staged_combine_bf16(void* output, float* output_weights,
+                         const void* bias0, const void* bias1,
+                         const int* send_head, const int* src_idx, const int* rank_prefix,
+                         const int* channel_prefix, const void* input, const float* weights,
+                         int input_tokens, int tokens, int hidden, int topk,
+                         int channels, int capacity, void** buffers,
+                         int** barriers, int rank, cudaStream_t stream, int sms);
+
 void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);
 
 } // namespace intranode
@@ -63,6 +71,15 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
               cudaStream_t stream, int num_sms,
               int num_max_send_tokens, int num_recv_buffer_tokens);
 
+void dense_dispatch(void* recv_x, float* recv_x_scales, float* recv_sf, int* recv_src,
+                    int64_t* recv_topk, float* recv_weights, int* recv_channels, int* send_head,
+                    const void* x, const float* x_scales, const float* sf,
+                    const int64_t* topk, const float* weights, const bool* selected,
+                    const int* channel_prefix, int tokens, int output_capacity, int hidden_int4,
+                    int num_topk, int experts, int scales, int num_sf, int scale_ts, int scale_hs,
+                    int sf_ts, int sf_hs, void** buffers, int** signals, int rank, int ranks,
+                    size_t buffer_bytes, cudaStream_t stream, int sms, bool skip_copyout);
+
 void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int,
                            int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);
 
@@ -75,6 +92,10 @@ void combine(cudaDataType_t type,
              void** buffer_ptrs, int rank, int num_ranks,
              cudaStream_t stream, int num_sms,
              int num_max_send_tokens, int num_recv_buffer_tokens);
+
+void dense_dispatch_permute_bf16(const void* scratch_x, const int64_t* scratch_topk,
+    const int* counts, void* output, int* m_indices, int64_t* inverse, int* starts,
+    int tokens, int hidden, int topk, int experts, int blocks, cudaStream_t stream);
 
 void deepgemm_permute_bf16(const void* recv_x, const int64_t* recv_topk_idx,
                            const int* num_recv_tokens_per_expert,

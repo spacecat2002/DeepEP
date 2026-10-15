@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "configs.cuh"
 #include "exception.cuh"
 #include "launch.cuh"
@@ -6,8 +7,46 @@ namespace deep_ep {
 
 namespace layout {
 
+// One pass over TopK, with shared histograms. The original implementation
+// rereads the complete router tensor for every four-expert slice.
+__global__ void ep4_layout_single_pass(const int64_t* ids, int* rank_counts,
+                                      int* expert_counts, bool* token_in_rank,
+                                      int tokens, int experts) {
+    __shared__ int histogram[512], counts[4];
+    for (int i = threadIdx.x; i < experts; i += blockDim.x) histogram[i] = 0;
+    if (threadIdx.x < 4) counts[threadIdx.x] = 0;
+    __syncthreads();
+    int local_counts[4] = {};
+    const int per_rank = experts / 4;
+    for (int token = blockIdx.x * blockDim.x + threadIdx.x;
+         token < tokens; token += gridDim.x * blockDim.x) {
+        unsigned mask = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int e = static_cast<int>(ids[static_cast<int64_t>(token) * 8 + k]);
+            if (e >= 0 && e < experts) {
+                atomicAdd(histogram + e, 1);
+                mask |= 1u << (e / per_rank);
+            }
+        }
+        #pragma unroll
+        for (int rank = 0; rank < 4; ++rank) {
+            const bool present = mask & (1u << rank);
+            token_in_rank[static_cast<int64_t>(token) * 4 + rank] = present;
+            local_counts[rank] += present;
+        }
+    }
+    #pragma unroll
+    for (int rank = 0; rank < 4; ++rank) atomicAdd(counts + rank, local_counts[rank]);
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x)
+        atomicAdd(expert_counts + e, histogram[e]);
+    if (threadIdx.x < 4) atomicAdd(rank_counts + threadIdx.x, counts[threadIdx.x]);
+}
+
 template <int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
-__global__ void get_dispatch_layout(const int64_t* topk_idx,
+__global__
+void get_dispatch_layout(const int64_t* topk_idx,
                                     int* num_tokens_per_rank, int* num_tokens_per_rdma_rank,
                                     int* num_tokens_per_expert, bool* is_token_in_rank,
                                     int num_tokens, int num_topk, int num_ranks, int num_experts) {
@@ -120,6 +159,16 @@ void get_dispatch_layout(const int64_t* topk_idx,
                          int* num_tokens_per_expert, bool* is_token_in_rank,
                          int num_tokens, int num_topk, int num_ranks, int num_experts,
                          cudaStream_t stream) {
+    const char* fast_env = std::getenv("DEEPEP_SINGLE_PASS_LAYOUT");
+    if (fast_env && fast_env[0] == '1' && fast_env[1] == '\0' &&
+        num_ranks == 4 && num_topk == 8 && num_experts <= 512 && !num_tokens_per_rdma_rank) {
+        CUDA_CHECK(cudaMemsetAsync(num_tokens_per_rank, 0, 4 * sizeof(int), stream));
+        CUDA_CHECK(cudaMemsetAsync(num_tokens_per_expert, 0, num_experts * sizeof(int), stream));
+        SETUP_LAUNCH_CONFIG(20, 256, stream);
+        LAUNCH_KERNEL(&cfg, ep4_layout_single_pass, topk_idx, num_tokens_per_rank,
+            num_tokens_per_expert, is_token_in_rank, num_tokens, num_experts);
+        return;
+    }
     constexpr int kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
     int num_sms = ((num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM) + (num_ranks + kNumRanksPerSM - 1) / kNumRanksPerSM;
     EP_STATIC_ASSERT(kNumRanksPerSM % NUM_MAX_NVL_PEERS == 0, "Invalid number of ranks per SM");

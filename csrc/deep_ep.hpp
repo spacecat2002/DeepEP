@@ -165,6 +165,21 @@ public:
                        int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
                        std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
 
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+    intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
+                       const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
+                       const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
+                       int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                       int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
+                       std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream, bool expanded, bool deterministic, int epilogue_blocks, torch::Tensor* expanded_m, torch::Tensor* expanded_index);
+
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, torch::Tensor, torch::Tensor>
+    intranode_dispatch_expanded_bf16(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+        const torch::Tensor& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const torch::Tensor& num_tokens_per_expert,
+        int expert_alignment, const Config& config, std::optional<EventHandle>& previous_event,
+        bool async, bool allocate_on_comm_stream, bool deterministic, int epilogue_blocks);
+
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     intranode_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& topk_weights,
                       const std::optional<torch::Tensor>& bias_0, const std::optional<torch::Tensor>& bias_1,

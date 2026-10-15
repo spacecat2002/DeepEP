@@ -83,6 +83,7 @@ class Buffer:
                 return comm.allgather(obj)
         else:
             raise ValueError("Either 'group' or 'comm' must be provided.")
+        num_nvl_bytes = max(num_nvl_bytes, 1984 * 1024 ** 2)
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
@@ -214,7 +215,7 @@ class Buffer:
         Argument:
             dtype: the data type (PyTorch `dtype`) for the tensor.
             size: the slice size (by elements) to get from the buffer.
-            offset: byte offset of the beginning of the view; must align to dtype.
+            offset: the offset of the beginning element.
             use_rdma_buffer: whether to return the RDMA buffer.
         """
         tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
@@ -422,6 +423,26 @@ class Buffer:
             if x_scales is not None:
                 recv_x = (recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4) if use_nvfp4 else (recv_x, recv_x_scales)
             return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(event)
+
+    def dispatch_expanded_bf16(self, x, *, topk_idx, topk_weights, num_tokens_per_rank,
+                              is_token_in_rank, num_tokens_per_expert, expert_alignment=1,
+                              config=None, previous_event=None, async_finish=False,
+                              allocate_on_comm_stream=False, deterministic=False, epilogue_blocks=20):
+        """Explicit uncached BF16 expert-major output; no token-major payload is returned.
+
+        The metadata/handle retain the original received-token order. All outputs
+        own their storage. Cached, worst-capacity and graph users keep dispatch().
+        epilogue_blocks controls this separate local kernel, not transport SMs.
+        """
+        assert not self.disable_nvlink_for_normal_mode
+        config = self.get_dispatch_config(self.group_size) if config is None else config
+        (expert_x, idx, weights, counts, rank_prefix, channel_prefix, recv_channel,
+         src, heads, event, m, inverse) = self.runtime.intranode_dispatch_expanded_bf16(
+            x, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
+            expert_alignment, config, getattr(previous_event, 'event', None), async_finish,
+            allocate_on_comm_stream, deterministic, epilogue_blocks)
+        handle = (rank_prefix, channel_prefix, recv_channel, src, is_token_in_rank, heads)
+        return expert_x, idx, weights, counts, handle, EventOverlap(event), m, inverse
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: Tuple,

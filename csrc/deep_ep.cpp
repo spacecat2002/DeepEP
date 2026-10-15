@@ -1,5 +1,7 @@
+#include "kernels/dense_dispatch_layout.cuh"
 // Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDADataType.h>
 #include <chrono>
 #include <cstdio>
@@ -294,15 +296,9 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
     torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
     auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
-    auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
-    TORCH_CHECK(offset >= 0 && offset <= num_bytes,
-                "DeepEP buffer offset must be within [0, capacity_bytes]");
-    TORCH_CHECK(offset % element_bytes == 0,
-                "DeepEP buffer offset must align to the requested dtype");
     auto base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
-    // An offset view owns only the remaining range, not the original capacity.
-    return torch::from_blob(base_ptr, (num_bytes - offset) / element_bytes,
-                            torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
+    auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
+    return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
 torch::Stream Buffer::get_comm_stream() const {
@@ -478,6 +474,50 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                            int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
                            int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
                            std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
+    return intranode_dispatch_impl(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
+        cached_num_recv_tokens, cached_rank_prefix_matrix, cached_channel_prefix_matrix, expert_alignment,
+        num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4, previous_event, async, allocate_on_comm_stream, false, false, 20, nullptr, nullptr);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, torch::Tensor, torch::Tensor>
+Buffer::intranode_dispatch_expanded_bf16(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+        const torch::Tensor& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const torch::Tensor& num_tokens_per_expert,
+        int expert_alignment, const Config& config, std::optional<EventHandle>& previous_event,
+        bool async, bool allocate_on_comm_stream, bool deterministic, int epilogue_blocks) {
+    // Reject unsupported contracts before submitting a collective operation.
+    const char* dense = std::getenv("DEEPEP_DISPATCH_DENSE_STAGE");
+    EP_HOST_ASSERT(dense && dense[0] == '1' && dense[1] == '\0');
+    EP_HOST_ASSERT((num_ranks == 2 || num_ranks == 4) && config.num_sms == 20);
+    EP_HOST_ASSERT(num_rdma_ranks == 1);
+    EP_HOST_ASSERT(x.is_cuda() && x.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(x.dim() == 2 && x.is_contiguous());
+    EP_HOST_ASSERT(topk_idx.is_cuda() && topk_idx.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(topk_idx.dim() == 2 && topk_idx.is_contiguous());
+    EP_HOST_ASSERT(topk_weights.is_cuda() && topk_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(topk_weights.sizes() == topk_idx.sizes() && topk_weights.is_contiguous());
+    for (auto& t : {topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert})
+        EP_HOST_ASSERT(t.is_cuda() && t.device() == x.device());
+    EP_HOST_ASSERT(topk_idx.size(1) <= 32 && expert_alignment > 0);
+    EP_HOST_ASSERT(epilogue_blocks == 20 || epilogue_blocks == 0);
+    cudaStreamCaptureStatus capture_status;
+    EP_HOST_ASSERT(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &capture_status) == cudaSuccess);
+    EP_HOST_ASSERT(capture_status == cudaStreamCaptureStatusNone);
+    torch::Tensor m, inverse;
+    auto r = intranode_dispatch_impl(x, std::nullopt, topk_idx, topk_weights,
+        num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, std::nullopt, std::nullopt,
+        expert_alignment, 0, config, false, std::nullopt, previous_event, async,
+        allocate_on_comm_stream, true, deterministic, epilogue_blocks, &m, &inverse);
+    return {std::get<0>(r), *std::get<3>(r), *std::get<4>(r), std::get<5>(r), std::get<6>(r),
+        std::get<7>(r), std::get<8>(r), std::get<9>(r), std::get<10>(r), std::get<11>(r), m, inverse};
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
+                           const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
+                           const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
+                           int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                           int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
+                           std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream, bool expanded, bool deterministic, int epilogue_blocks, torch::Tensor* expanded_m, torch::Tensor* expanded_index) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
 #endif
@@ -674,7 +714,24 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     }
 
     // Allocate new tensors
-    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    torch::Tensor recv_x, expanded_counts, expanded_starts;
+    if (expanded) {
+        c10::cuda::CUDAStreamGuard guard(comm_stream);
+        int64_t output_rows = 0;
+        for (int count : num_recv_tokens_per_expert_list) output_rows += count;
+        recv_x = deterministic ? torch::zeros({output_rows, hidden}, x.options())
+                               : torch::empty({output_rows, hidden}, x.options());
+        auto ints = x.options().dtype(torch::kInt32);
+        *expanded_m = torch::empty({output_rows}, ints);
+        *expanded_index = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
+        expanded_starts = torch::empty({num_local_experts}, ints);
+        // ATen's pinned allocator records the asynchronous H2D lifetime.
+        auto host_counts = torch::empty({num_local_experts}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+        std::copy(num_recv_tokens_per_expert_list.begin(), num_recv_tokens_per_expert_list.end(), host_counts.data_ptr<int>());
+        expanded_counts = host_counts.to(x.device(), true);
+    } else {
+        recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    }
     auto recv_src_idx = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(), recv_x_scales = std::optional<torch::Tensor>(), recv_sf_scale_for_nvfp4 = std::optional<torch::Tensor>();
     auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -714,6 +771,47 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales +           // FP8 scale buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_sf_scales_for_nvfp4 // NVFP4 sf_scale buffer
                    <= num_nvl_bytes);
+    const char* dense_setting = std::getenv("DEEPEP_DISPATCH_DENSE_STAGE");
+    const bool dense_stage = dense_setting && dense_setting[0] == '1' && dense_setting[1] == '\0' &&
+        (num_ranks == 2 || num_ranks == 4) && config.num_sms == 20;
+    const char* engine_setting = std::getenv("DEEPEP_DENSE_STAGE_COPY_ENGINE");
+    const bool copy_engine = dense_stage && !cached_mode && num_worst_tokens == 0 && engine_setting &&
+        engine_setting[0] == '1' && engine_setting[1] == '\0';
+    if (dense_stage) {
+        const intranode::DenseDispatchLayout dense_layout(num_recv_tokens,
+            static_cast<size_t>(hidden) * recv_x.element_size(), num_ranks, num_channels,
+            num_topk, num_scales, num_sf_scales_for_nvfp4);
+        if (copy_engine)
+            EP_HOST_ASSERT(dense_layout.bytes <= static_cast<size_t>(num_nvl_bytes));
+        intranode::dense_dispatch(recv_x.data_ptr(), recv_x_scales_ptr, recv_sf_scale_for_nvfp4_ptr,
+            recv_src_idx.data_ptr<int>(), recv_topk_idx_ptr, recv_topk_weights_ptr,
+            recv_channel_prefix_matrix.data_ptr<int>(), send_head.data_ptr<int>(), x.data_ptr(),
+            x_scales_ptr, sf_scale_for_nvfp4_ptr, topk_idx_ptr, topk_weights_ptr,
+            is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
+            num_tokens, num_recv_tokens, static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)),
+            num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4,
+            scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride,
+            sf_scale_for_nvfp4_hidden_stride, buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
+            rank, num_ranks, num_nvl_bytes, comm_stream, config.num_sms, copy_engine || expanded);
+        if (copy_engine || expanded) {
+            // Copy into independent Torch allocations; do not expose scratch aliases.
+            auto local = static_cast<uint8_t*>(buffer_ptrs[rank]);
+            auto copy = [&](void* output, size_t offset, size_t bytes) {
+                if (bytes)
+                    CUDA_CHECK(cudaMemcpyAsync(output, local + offset, bytes,
+                                               cudaMemcpyDeviceToDevice, comm_stream));
+            };
+            const size_t rows = num_recv_tokens;
+            if (!expanded) copy(recv_x.data_ptr(), dense_layout.x, rows * hidden * recv_x.element_size());
+            copy(recv_src_idx.data_ptr(), dense_layout.source, rows * sizeof(int));
+            copy(recv_topk_idx_ptr, dense_layout.topk, rows * num_topk * sizeof(int64_t));
+            copy(recv_topk_weights_ptr, dense_layout.weights, rows * num_topk * sizeof(float));
+            copy(recv_x_scales_ptr, dense_layout.scales, rows * num_scales * sizeof(float));
+            copy(recv_sf_scale_for_nvfp4_ptr, dense_layout.sf, rows * num_sf_scales_for_nvfp4 * sizeof(float));
+            copy(recv_channel_prefix_matrix.data_ptr(), dense_layout.channel,
+                 num_ranks * num_channels * sizeof(int));
+        }
+    } else {
     intranode::dispatch(recv_x.data_ptr(), recv_x_scales_ptr, recv_sf_scale_for_nvfp4_ptr, recv_src_idx.data_ptr<int>(), recv_topk_idx_ptr, recv_topk_weights_ptr, recv_channel_prefix_matrix.data_ptr<int>(),
                         send_head.data_ptr<int>(),
                         x.data_ptr(), x_scales_ptr, sf_scale_for_nvfp4_ptr, topk_idx_ptr, topk_weights_ptr,
@@ -723,6 +821,25 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride,
                         buffer_ptrs_gpu, rank, num_ranks, comm_stream, config.num_sms,
                         config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens);
+    }
+
+    if (expanded) {
+        // All scratch reads finish on the protected comm stream before event publication.
+        const intranode::DenseDispatchLayout layout(num_recv_tokens, hidden * x.element_size(),
+            num_ranks, num_channels, num_topk, 0, 0);
+        auto local = static_cast<const uint8_t*>(buffer_ptrs[rank]);
+        intranode::dense_dispatch_permute_bf16(local + layout.x,
+            reinterpret_cast<const int64_t*>(local + layout.topk), expanded_counts.data_ptr<int>(),
+            recv_x.data_ptr(), expanded_m->data_ptr<int>(), expanded_index->data_ptr<int64_t>(),
+            expanded_starts.data_ptr<int>(), num_recv_tokens, hidden, num_topk,
+            num_local_experts, epilogue_blocks, comm_stream);
+        for (auto& t : {*expanded_m, *expanded_index, expanded_counts, expanded_starts, recv_x}) {
+            t.record_stream(comm_stream);
+            // Expanded allocations use the comm guard regardless of the outer
+            // allocation mode. Register the caller's consumer stream in all modes.
+            t.record_stream(compute_stream);
+        }
+    }
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -804,7 +921,10 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    intranode::cached_notify_combine(buffer_ptrs_gpu, send_head.data_ptr<int>(),
+    const char* staged_env = std::getenv("DEEPEP_STAGED_COMBINE");
+    const bool staged = num_ranks == 4 && x.scalar_type() == torch::kBFloat16 &&
+        staged_env && staged_env[0] == '1' && staged_env[1] == '\0';
+    if (!staged) intranode::cached_notify_combine(buffer_ptrs_gpu, send_head.data_ptr<int>(),
                                      num_channels, num_recv_tokens, num_channels * num_ranks * 2,
                                      barrier_signal_ptrs_gpu, rank, num_ranks,
                                      comm_stream);
@@ -827,7 +947,20 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                  // Source index buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)       // Top-k weight buffer
                    <= num_nvl_bytes);
-    intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
+    if (staged) {
+        constexpr int capacity = 327680;
+        const int64_t payload_bytes = static_cast<int64_t>(capacity) * hidden * x.element_size();
+        const int64_t weights_offset = 4096 + payload_bytes;
+        EP_HOST_ASSERT(num_tokens <= capacity &&
+            weights_offset + static_cast<int64_t>(capacity) * num_topk * sizeof(float) <= num_nvl_bytes);
+        EP_HOST_ASSERT(64 + num_ranks * num_channels * sizeof(int) <= 4096);
+        intranode::staged_combine_bf16(recv_x.data_ptr(), recv_topk_weights_ptr,
+            bias_ptrs[0], bias_ptrs[1], send_head.data_ptr<int>(), src_idx.data_ptr<int>(),
+            rank_prefix_matrix.data_ptr<int>(), channel_prefix_matrix.data_ptr<int>(),
+            x.data_ptr(), topk_weights_ptr, num_tokens, num_recv_tokens,
+            hidden, num_topk, num_channels, capacity, buffer_ptrs_gpu,
+            barrier_signal_ptrs_gpu, rank, comm_stream, config.num_sms);
+    } else intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(), recv_topk_weights_ptr,
                        x.data_ptr(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1],
                        src_idx.data_ptr<int>(), rank_prefix_matrix.data_ptr<int>(), channel_prefix_matrix.data_ptr<int>(),
@@ -1994,6 +2127,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
+        .def("intranode_dispatch_expanded_bf16", &deep_ep::Buffer::intranode_dispatch_expanded_bf16)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
