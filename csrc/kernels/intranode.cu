@@ -3,12 +3,17 @@
 #include "exception.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
-#include "dense_dispatch_layout.cuh"
 #include "api.cuh"
 
 namespace deep_ep {
 
 namespace intranode {
+
+inline bool env_flag_default(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return default_value;
+    return value[0] == '1' && value[1] == '\0';
+}
 
 template <int kNumRanks>
 __device__ __forceinline__ void load_rank_bits(const bool* row, uint64_t (&bits)[2]) {
@@ -51,9 +56,14 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
         int num_experts_per_rank = num_experts / kNumRanks;
         if (thread_id < kNumRanks) {
             per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id];
-            #pragma unroll
-            for (int i = 0; i < num_experts_per_rank; ++ i)
-                per_expert_buffer[rank * num_experts_per_rank + i] = num_tokens_per_expert[thread_id * num_experts_per_rank + i];
+        }
+        // Publish expert counts with coalesced workers instead of four
+        // threads serially issuing every peer's expert-count stores.
+        for (int expert = thread_id; expert < num_experts; expert += num_threads) {
+            const int destination = expert / num_experts_per_rank;
+            const int local_expert = expert % num_experts_per_rank;
+            auto destination_counts = static_cast<int*>(buffer_ptrs[destination]) + kNumRanks * kNumRanks;
+            destination_counts[rank * num_experts_per_rank + local_expert] = num_tokens_per_expert[expert];
         }
 
         // Wait for all ranks to be finished
@@ -80,7 +90,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
-        // Publish prefix columns and finish expert reads before copy/queue clearing.
+        // Finish expert reads before copy/queue clearing.
         __syncthreads();
 
         // Copy rank size prefix matrix to another tensor
@@ -101,8 +111,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-            // Iterate over tokens once, accumulating all destination ranks.
             int counts[kNumRanks] = {0};
+
+            // Iterate over tokens once, accumulating all destination ranks.
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
                 uint64_t bits[2];
                 load_rank_bits<kNumRanks>(is_token_in_rank + i * kNumRanks, bits);
@@ -114,6 +125,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
             #pragma unroll
             for (int dst_rank = 0; dst_rank < kNumRanks; ++dst_rank)
                 counts[dst_rank] = warp_reduce_sum(counts[dst_rank]);
+
             if (elect_one_sync()) {
                 #pragma unroll
                 for (int dst_rank = 0; dst_rank < kNumRanks; ++dst_rank)
@@ -141,15 +153,16 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
                      void** buffer_ptrs, int** barrier_signal_ptrs, int rank,
                      cudaStream_t stream, int num_channels) {
-#define NOTIFY_DISPATCH_LAUNCH_CASE(ranks) \
-    LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, \
+#define NOTIFY_DISPATCH_LAUNCH_CASE(ranks) { \
+    auto kernel = notify_dispatch<ranks>; \
+    LAUNCH_KERNEL(&cfg, kernel, \
         num_tokens_per_rank, moe_recv_counter_mapped, \
         num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, \
         num_tokens, num_channels, is_token_in_rank, channel_prefix_matrix, \
         rank_prefix_matrix_copy, num_memset_int, expert_alignment, \
         buffer_ptrs, barrier_signal_ptrs, rank); \
     LAUNCH_KERNEL(&prefix_cfg, prefix_sum<ranks>, channel_prefix_matrix, num_channels); \
-    break
+    } break
 
     constexpr int kNumThreads = 128;
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
@@ -199,42 +212,6 @@ __global__ void deepgemm_scatter_bf16(const int4* recv_x,
 }
 
 // Owned expert-major epilogue: IPC scratch is consumed before dispatch completion.
-__global__ void dense_receive_permute_bf16(const int4* scratch_x, const int64_t* scratch_topk,
-    int4* output, int64_t* inverse, int* starts, int tokens, int hidden_int4, int topk, int experts) {
-    __shared__ int rows[32];
-    for (int token = blockIdx.x; token < tokens; token += gridDim.x) {
-        if (threadIdx.x < topk) {
-            const int k = threadIdx.x;
-            const int64_t expert = ld_nc_global(scratch_topk + static_cast<size_t>(token) * topk + k);
-            EP_DEVICE_ASSERT(expert < experts);
-            const int row = expert >= 0 ? atomicAdd(starts + expert, 1) : -1;
-            rows[k] = row;
-            inverse[static_cast<size_t>(token) * topk + k] = row;
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < hidden_int4; i += blockDim.x) {
-            const int4 value = ld_nc_global(scratch_x + static_cast<size_t>(token) * hidden_int4 + i);
-            for (int k = 0; k < topk; ++k)
-                if (rows[k] >= 0)
-                    output[static_cast<size_t>(rows[k]) * hidden_int4 + i] = value;
-        }
-        __syncthreads(); // Do not reuse reservations before every payload store finishes.
-    }
-}
-
-void dense_dispatch_permute_bf16(const void* scratch_x, const int64_t* scratch_topk,
-    const int* counts, void* output, int* m_indices, int64_t* inverse, int* starts,
-    int tokens, int hidden, int topk, int experts, int blocks, cudaStream_t stream) {
-    EP_HOST_ASSERT(topk <= 32 && hidden % 8 == 0);
-    deepgemm_init_layout<<<experts, 256, 0, stream>>>(counts, starts, m_indices);
-    if (tokens) {
-        dense_receive_permute_bf16<<<blocks ? blocks : tokens, 256, 0, stream>>>(
-            static_cast<const int4*>(scratch_x), scratch_topk, static_cast<int4*>(output),
-            inverse, starts, tokens, hidden / 8, topk, experts);
-    }
-    CUDA_CHECK(cudaGetLastError());
-}
-
 void deepgemm_permute_bf16(const void* recv_x, const int64_t* recv_topk_idx,
                            const int* num_recv_tokens_per_expert,
                            void* output, int* m_indices, int64_t* output_index,
@@ -288,7 +265,7 @@ void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseTMA = true>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseTMA = true, bool kLocalBypass = false, int kScanMode = 0, int kRouteMode = 0>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
          int* send_head, const int4* x, const float* x_scales, const float* sf_scale_for_nvfp4, const int64_t* topk_idx, const float* topk_weights,
@@ -302,10 +279,111 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     const bool is_sender = sm_id % 2 == 0;
     EP_DEVICE_ASSERT(num_sms % 2 == 0);
 
+    // Clear padding before sender/receiver branches can return early.
+    // Valid payload rows are disjoint from this tail, including split streams.
+    if (num_worst_tokens > 0 && kRouteMode != 1) {
+        auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
+        const auto num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank];
+        const auto clean_start = num_recv_tokens * num_topk + sm_id * kNumThreads;
+        const auto clean_end = num_worst_tokens * num_topk;
+        const auto clean_stride = num_sms * kNumThreads;
+        #pragma unroll
+        for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
+            recv_topk_idx[i] = -1;
+    }
+
     // Several warps are response for a single rank
-    const auto num_threads_per_rank = kNumThreads / kNumRanks;
+    int num_threads_per_rank = kNumThreads / kNumRanks;
     const auto num_channels = num_sms / 2;
-    const auto responsible_rank = (static_cast<int>(thread_id)) / num_threads_per_rank;
+    int responsible_rank = thread_id / num_threads_per_rank;
+    int rank_thread_begin = responsible_rank * num_threads_per_rank;
+    // The remote-only receiver has no self FIFO to drain. Reassign its
+    // otherwise idle warp group evenly to the three actual remote sources.
+    if constexpr (kRouteMode == 2 && kNumRanks == 4) {
+        if (!is_sender) {
+            num_threads_per_rank = kNumThreads / (kNumRanks - 1);
+            const int source_group = thread_id / num_threads_per_rank;
+            responsible_rank = source_group + (source_group >= rank);
+            rank_thread_begin = source_group * num_threads_per_rank;
+        }
+    }
+    __shared__ int sender_total_rows;
+    __shared__ int sender_warp_counts[kNumRanks];
+    __shared__ int sender_warp_offsets[kNumRanks];
+    if constexpr (kScanMode >= 4) {
+        if (is_sender) {
+            // Compute the per-destination warp allocation once per sender
+            // block. Repeating this prefix arithmetic in all 768 threads was
+            // pure fixed overhead; every thread only needs the final mapping.
+            if (thread_id == 0) {
+                int total_rows = 0;
+                for (int destination = 0; destination < kNumRanks; ++destination) {
+                    const int* prefix = channel_prefix_matrix + destination * num_channels;
+                    if ((kRouteMode != 1 || destination == rank) &&
+                        (kRouteMode != 2 || destination != rank))
+                        total_rows += prefix[sm_id / 2] - (sm_id / 2 ? prefix[sm_id / 2 - 1] : 0);
+                }
+                sender_total_rows = total_rows;
+                for (int destination = 0; destination < kNumRanks; ++destination) {
+                    sender_warp_offsets[destination] = destination;
+                    sender_warp_counts[destination] = 1;
+                }
+                if (total_rows > 0) {
+                // Split kernels allocate workers only to destinations they execute.
+                constexpr int active_ranks = kRouteMode == 1 ? 1 :
+                    kRouteMode == 2 ? kNumRanks - 1 : kNumRanks;
+                constexpr int extra_warps = kNumThreads / 32 - active_ranks;
+                int64_t remainders[kNumRanks];
+                int remaining_warps = kNumThreads / 32;
+                #pragma unroll
+                for (int destination = 0; destination < kNumRanks; ++destination) {
+                    const int* prefix = channel_prefix_matrix + destination * num_channels;
+                    int rows = prefix[sm_id / 2] - (sm_id / 2 ? prefix[sm_id / 2 - 1] : 0);
+                    if ((kRouteMode == 1 && destination != rank) ||
+                        (kRouteMode == 2 && destination == rank)) rows = 0;
+                    const int64_t scaled_rows = static_cast<int64_t>(rows) * extra_warps;
+                    const bool active = (kRouteMode != 1 || destination == rank) &&
+                        (kRouteMode != 2 || destination != rank);
+                    sender_warp_counts[destination] = active + static_cast<int>(scaled_rows / total_rows);
+                    remainders[destination] = scaled_rows % total_rows;
+                    remaining_warps -= sender_warp_counts[destination];
+                }
+                // Largest remainder preserves equal shares for nearly equal
+                // peers. Prefix rounding can otherwise turn 6/6/6/6 into
+                // 5/6/6/7 and delay an almost equally loaded destination.
+                #pragma unroll
+                for (int destination = 0; destination < kNumRanks; ++destination) {
+                    int priority = 0;
+                    #pragma unroll
+                    for (int other = 0; other < kNumRanks; ++other)
+                        priority += remainders[other] > remainders[destination] ||
+                            (remainders[other] == remainders[destination] && other < destination);
+                    sender_warp_counts[destination] += priority < remaining_warps;
+                }
+                int first_warp = 0;
+                for (int destination = 0; destination < kNumRanks; ++destination) {
+                    sender_warp_offsets[destination] = first_warp;
+                    first_warp += sender_warp_counts[destination];
+                }
+                }
+            }
+            __syncthreads();
+            if (sender_total_rows > 0) {
+                const int warp_id = thread_id / 32;
+                #pragma unroll
+                for (int destination = 0; destination < kNumRanks; ++destination) {
+                    const int first_warp = sender_warp_offsets[destination];
+                    const int last_warp = first_warp + sender_warp_counts[destination];
+                    if (warp_id >= first_warp && warp_id < last_warp) {
+                        responsible_rank = destination;
+                        rank_thread_begin = first_warp * 32;
+                        num_threads_per_rank = sender_warp_counts[destination] * 32;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     const auto responsible_channel = sm_id / 2;
 
@@ -314,6 +392,13 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_DEVICE_ASSERT((topk_idx == nullptr)  == (topk_weights == nullptr));
     EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
+
+    auto ring_slot = [&](int ordinal) {
+        if constexpr (kScanMode >= 6) {
+            return ordinal & (num_recv_buffer_tokens - 1);
+        }
+        return ordinal % num_recv_buffer_tokens;
+    };
 
     // Calculate pointers by the specific layout
     // `rank_prefix_matrix`: kNumRanks * kNumRanks * sizeof(int)
@@ -349,17 +434,37 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     auto channel_x_scales_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales, channel_rank_offset * num_recv_buffer_tokens * num_scales);
     auto channel_x_sf_scale_for_nvfp4_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_sf_scales_for_nvfp4, channel_rank_offset * num_recv_buffer_tokens * num_sf_scales_for_nvfp4);
 
+        const int local_begin = rank > 0
+            ? static_cast<int*>(buffer_ptrs[rank])[(rank - 1) * kNumRanks + rank]
+            : 0;
+        const bool local_destination = kLocalBypass && responsible_rank == rank;
+        const int local_rank_offset = local_destination ? local_begin : 0;
+        const int local_channel_offset = local_destination && responsible_channel > 0
+            ? __ldg(channel_prefix_matrix + rank * num_channels + responsible_channel - 1)
+            : 0;
+        const int local_output_rows = local_destination
+            ? static_cast<int*>(buffer_ptrs[rank])[(kNumRanks - 1) * kNumRanks + rank]
+            : 0;
+
     // TMA stuffs
 #ifndef DISABLE_SM90_FEATURES
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
-    auto half_hidden_int4 = hidden_int4 / 2;
-    auto half_hidden_bytes = half_hidden_int4 * static_cast<int>(sizeof(int4));
+    // Keep the existing per-warp shared-memory slice. A whole row avoids
+    // a second TMA load/wait/store when it fits; larger rows retain two parts.
+    const int tma_parts = kScanMode == 9 ? 1 : kScanMode >= 3 &&
+        static_cast<int64_t>(hidden_int4) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp ? 1 : 2;
+    const int half_hidden_int4 = hidden_int4 / tma_parts;
+    const int half_hidden_bytes = half_hidden_int4 * static_cast<int>(sizeof(int4));
     auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + half_hidden_bytes);
     uint32_t tma_phase = 0;
     if constexpr (kUseTMA) {
         // Validate the complete warp slice before initializing its barrier.
         EP_DEVICE_ASSERT(hidden_int4 % 2 == 0 and half_hidden_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        // Local bypass still uses the same compact TMA copy when available;
+        // it writes the final receive layout directly and does not touch the
+        // remote queue. Initializing the per-warp barrier is therefore needed
+        // for both local and remote payload copies.
         if (elect_one_sync()) {
             mbarrier_init(tma_mbarrier, 1);
             fence_barrier_init();
@@ -371,15 +476,21 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     if (is_sender) {
         // Workers for sending
         constexpr int num_send_warps = kNumThreads / 32;
-        constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
+        const int num_send_warps_per_rank = num_threads_per_rank / 32;
         const auto send_thread_id = thread_id;
-        const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / 32;
+        const auto send_warp_id_in_rank = (send_thread_id - rank_thread_begin) / 32;
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
-
+        constexpr bool local_only = kRouteMode == 1;
+        constexpr bool remote_only = kRouteMode == 2;
+        const bool process_destination = (!local_only || local_destination) &&
+            (!remote_only || !local_destination);
+        if (!process_destination) return;
+        const bool write_head = process_destination;
+        const bool write_metadata = process_destination;
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (send_warp_id_in_rank == 0 and elect_one_sync()) {
+        if (write_metadata && send_warp_id_in_rank == 0 and elect_one_sync()) {
             int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
             st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
@@ -391,13 +502,107 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         int token_start_idx, token_end_idx;
         get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
 
+        // Local rows bypass the queue and are written directly to the final
+        // receive layout. Publish their channel base directly so the paired
+        // receiver block can return without polling an empty queue.
+        if constexpr (kLocalBypass) {
+            if (local_destination && kRouteMode == 1 && send_warp_id_in_rank == 0 && elect_one_sync()) {
+                const int channel_begin = responsible_channel > 0
+                    ? __ldg(channel_prefix_matrix + rank * num_channels + responsible_channel - 1)
+                    : 0;
+                st_relaxed_sys_global(
+                    recv_channel_offset + responsible_rank * num_channels + responsible_channel,
+                    channel_begin);
+            }
+        }
+
+        auto copy_payload = [&](int64_t token_idx, int ordinal) {
+            int dst_slot_idx = ring_slot(ordinal);
+            const int local_output_row = local_rank_offset + local_channel_offset + ordinal;
+            if (local_destination)
+                EP_DEVICE_ASSERT(local_output_row >= 0 && local_output_row < local_output_rows);
+            // Copy data
+            auto shifted_channel_x_buffers = local_destination
+                ? reinterpret_cast<int4*>(recv_x) +
+                      static_cast<int64_t>(local_output_row) * hidden_int4
+                : channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
+            auto shifted_x = x + token_idx * hidden_int4;
+#ifndef DISABLE_SM90_FEATURES
+            if constexpr (kLocalBypass) {
+                if constexpr (kScanMode == 9 && kUseTMA) {
+                // This specialization is selected only when the full row fits
+                // the existing warp slice; larger rows use the generic copy.
+                tma_store_wait<0>();
+                if (elect_one_sync()) {
+                    tma_load_1d(tma_buffer, shifted_x, tma_mbarrier, half_hidden_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, half_hidden_bytes);
+                    mbarrier_wait(tma_mbarrier, tma_phase);
+                    tma_store_1d(tma_buffer, shifted_channel_x_buffers, half_hidden_bytes, false);
+                }
+                __syncwarp();
+                } else
+#endif
+                {
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
+                }
+            } else {
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4,
+                                   shifted_channel_x_buffers, shifted_x,
+                                   __ldg, st_na_global);
+            }
+
+            // Copy source index
+            if (elect_one_sync())
+                (local_destination ? recv_src_idx[local_output_row]
+                                   : channel_src_idx_buffers[dst_slot_idx]) = static_cast<int>(token_idx);
+
+            // Copy `topk_idx` and `topk_weights` with transformed index
+            if (lane_id < num_topk) {
+                // Top-k index
+                int recv_expert_begin = responsible_rank * num_experts_per_rank, recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
+                auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
+                idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
+                (local_destination
+                     ? recv_topk_idx[static_cast<int64_t>(local_output_row) * num_topk + lane_id]
+                     : channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id]) = idx_value;
+
+                // Top-k weights
+                auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
+                weight_value = (idx_value >= 0) ? weight_value : 0.0f;
+                (local_destination
+                     ? recv_topk_weights[static_cast<int64_t>(local_output_row) * num_topk + lane_id]
+                     : channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id]) = weight_value;
+            }
+
+            // Copy `x_scales`
+            #pragma unroll
+            for (int i = lane_id; i < num_scales; i += 32) {
+                auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
+                (local_destination
+                     ? recv_x_scales[static_cast<int64_t>(local_output_row) * num_scales + i]
+                     : channel_x_scales_buffers[dst_slot_idx * num_scales + i]) = __ldg(x_scales + offset);
+            }
+
+            // Copy `sf_scale_for_nvfp4`
+            #pragma unroll
+            for (int i = lane_id; i < num_sf_scales_for_nvfp4; i += 32) {
+                auto offset = token_idx * sf_scale_for_nvfp4_token_stride + i * sf_scale_for_nvfp4_hidden_stride;
+                (local_destination
+                     ? recv_x_sf_scale_for_nvfp4[static_cast<int64_t>(local_output_row) * num_sf_scales_for_nvfp4 + i]
+                     : channel_x_sf_scale_for_nvfp4_buffers[dst_slot_idx * num_sf_scales_for_nvfp4 + i]) = __ldg(sf_scale_for_nvfp4 + offset);
+            }
+
+        };
+
         // Iterate over all tokens and send by chunks
         int cached_channel_tail_idx = 0;
+        int tile_base = token_start_idx, tile_end = token_start_idx;
+        unsigned selected_mask = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; ) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            if (elect_one_sync()) {
+            if (process_destination && !local_destination && elect_one_sync()) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                     int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
@@ -415,82 +620,97 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 
             int chunk_token_idx = 0;
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
-                // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the following data
-                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
-                    send_head[token_idx * kNumRanks + responsible_rank] = is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
-
-                // Skip if not selected
-                if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
-                    token_idx ++;
+                if constexpr (kScanMode >= 2) {
+                    // All warps agree on chunk/tile boundaries, but each warp
+                    // enumerates only its own payload rows within a tile.
+                    if (token_idx >= tile_end) {
+                        tile_base = static_cast<int>(token_idx);
+                        tile_end = min(tile_base + 32, token_end_idx);
+                        bool selected = tile_base + lane_id < tile_end &&
+                            is_token_in_rank[(tile_base + lane_id) * kNumRanks + responsible_rank];
+                        selected_mask = __ballot_sync(0xffffffff, selected);
+                        if (send_warp_id_in_rank == 0 && tile_base + lane_id < tile_end) {
+                            int prefix = __popc(selected_mask & ((1u << lane_id) - 1));
+                            if (write_head)
+                                send_head[(tile_base + lane_id) * kNumRanks + responsible_rank] =
+                                    selected ? cached_channel_tail_idx + prefix : -1;
+                        }
+                    }
+                    int available = __popc(selected_mask);
+                    int take = min(available, num_max_send_tokens - chunk_token_idx);
+                    unsigned before_lane = (1u << lane_id) - 1;
+                    int prefix = __popc(selected_mask & before_lane);
+                    bool in_chunk = (selected_mask & (1u << lane_id)) && prefix < take;
+                    unsigned chunk_mask = __ballot_sync(0xffffffff, in_chunk);
+                    unsigned owned_mask = __ballot_sync(0xffffffff, in_chunk &&
+                        (cached_channel_tail_idx + prefix + 1) % num_send_warps_per_rank == send_warp_id_in_rank);
+                    while (owned_mask) {
+                        int selected_lane = __ffs(owned_mask) - 1;
+                        int ordinal = cached_channel_tail_idx +
+                            __popc(chunk_mask & ((1u << selected_lane) - 1));
+                        copy_payload(tile_base + selected_lane, ordinal);
+                        owned_mask &= owned_mask - 1;
+                    }
+                    cached_channel_tail_idx += take;
+                    chunk_token_idx += take;
+                    selected_mask &= ~chunk_mask;
+                    token_idx = selected_mask ? tile_base + __ffs(selected_mask) - 1 : tile_end;
                     continue;
                 }
 
-                // Get an empty slot
-                int dst_slot_idx = (cached_channel_tail_idx ++) % num_recv_buffer_tokens;
-                if (cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank) {
-                    // Copy data
-                    auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
-                    auto shifted_x = x + token_idx * hidden_int4;
-                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
-
-                    // Copy source index
-                    if (elect_one_sync())
-                        channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
-
-                    // Copy `topk_idx` and `topk_weights` with transformed index
-                    if (lane_id < num_topk) {
-                        // Top-k index
-                        int recv_expert_begin = responsible_rank * num_experts_per_rank, recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
-                        auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
-                        idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
-                        channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] = idx_value;
-
-                        // Top-k weights
-                        auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
-                        weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = weight_value;
+                    if (write_head && token_idx % num_send_warps_per_rank == send_warp_id_in_rank && elect_one_sync())
+                        send_head[token_idx * kNumRanks + responsible_rank] = is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
+                    if (!is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
+                        token_idx++;
+                        continue;
                     }
 
-                    // Copy `x_scales`
-                    #pragma unroll
-                    for (int i = lane_id; i < num_scales; i += 32) {
-                        auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                        channel_x_scales_buffers[dst_slot_idx * num_scales + i] = __ldg(x_scales + offset);
-                    }
-
-                    // Copy `sf_scale_for_nvfp4`
-                    #pragma unroll
-                    for (int i = lane_id; i < num_sf_scales_for_nvfp4; i += 32) {
-                        auto offset = token_idx * sf_scale_for_nvfp4_token_stride + i * sf_scale_for_nvfp4_hidden_stride;
-                        channel_x_sf_scale_for_nvfp4_buffers[dst_slot_idx * num_sf_scales_for_nvfp4 + i] = __ldg(sf_scale_for_nvfp4 + offset);
-                    }
-
-                }
+                const int ordinal = cached_channel_tail_idx++;
+                if (process_destination && cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank)
+                    copy_payload(token_idx, ordinal);
 
                 // Move token index
                 chunk_token_idx ++, token_idx ++;
             }
 
+            // Complete asynchronous payload stores before publishing the
+            // channel tail. A read-only wait would allow premature publication.
+#ifndef DISABLE_SM90_FEATURES
+            if constexpr (kScanMode == 9 && kUseTMA) {
+                asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                __syncwarp();
+            }
+#endif
             // Move tail index
             // NOTES: here all warps should share the same new tail
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
-            if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+            if (process_destination && !local_destination) {
+                if (send_warp_id_in_rank == 0 and elect_one_sync())
+                    st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+            }
         }
     } else {
+        if constexpr (kRouteMode == 1)
+            return;
         // Workers for receiving and copying into buffer
         constexpr int num_recv_warps = kNumThreads / 32;
-        constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
         const auto recv_thread_id = thread_id;
-        const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
+        const auto recv_thread_id_in_rank = recv_thread_id - rank_thread_begin;
         const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
+        constexpr int num_recv_warps_per_rank = kNumThreads / 32 /
+            (kRouteMode == 2 && kNumRanks == 4 ? kNumRanks - 1 : kNumRanks);
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
         // Calculate offset first
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
-
+        if constexpr (kRouteMode == 2) {
+            if constexpr (kLocalBypass) {
+                if (responsible_rank == rank)
+                    return;
+            }
+        }
         // Receive channel offset
         int total_offset, num_tokens_to_recv;
         if (elect_one_sync()) {
@@ -504,6 +724,13 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         total_offset = __shfl_sync(0xffffffff, total_offset, 0);
         total_offset += rank_offset;
         num_tokens_to_recv = __shfl_sync(0xffffffff, num_tokens_to_recv, 0);
+
+        // Self-destination rows were written directly by the sender warps into
+        // the final receive tensors, so this receiver group has no queue to drain.
+        if constexpr (kLocalBypass) {
+            if (responsible_rank == rank)
+                return;
+        }
 
         // Shared tail indices for different warps
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
@@ -535,13 +762,13 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < num_recv_tokens; chunk_idx += num_recv_warps_per_rank) {
-                int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
+                int token_idx_in_buffer = ring_slot(cached_channel_head_idx + chunk_idx);
                 auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4;
                 auto shifted_recv_x_int4 = recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
 #ifndef DISABLE_SM90_FEATURES
                 if constexpr (kUseTMA) {
                     #pragma unroll
-                    for (int i = 0; i < 2; ++ i) {
+                    for (int i = 0; i < tma_parts; ++ i) {
                         tma_store_wait<0>();
                         if (elect_one_sync()) {
                             tma_load_1d(tma_buffer, shifted_buffer_x_int4 + i * half_hidden_int4, tma_mbarrier, half_hidden_bytes);
@@ -563,13 +790,13 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             // Copy `src_idx`
             #pragma unroll 4
             for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank; chunk_idx < cached_channel_tail_idx; chunk_idx += 32 * num_recv_warps_per_rank)
-                recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] = ld_nc_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
+                recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] = ld_nc_global(channel_src_idx_buffers.buffer() + ring_slot(chunk_idx));
 
             // Copy `topk_idx` and `topk_weights`
             #pragma unroll 4
             for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk; idx += 32 * num_recv_warps_per_rank) {
                 int chunk_idx = idx / num_topk, token_topk_idx = idx % num_topk;
-                int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
+                int token_idx_in_buffer = ring_slot(cached_channel_head_idx + chunk_idx);
                 auto recv_idx = static_cast<int64_t>(total_offset + chunk_idx) * num_topk + token_topk_idx;
                 auto buffer_idx = token_idx_in_buffer * num_topk + token_topk_idx;
                 recv_topk_idx[recv_idx] = ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx);
@@ -580,7 +807,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             #pragma unroll 4
             for (int i = recv_thread_id_in_rank; i < num_recv_tokens * num_scales; i += 32 * num_recv_warps_per_rank) {
                 int chunk_idx = i / num_scales, scales_idx = i % num_scales;
-                int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
+                int token_idx_in_buffer = ring_slot(cached_channel_head_idx + chunk_idx);
                 recv_x_scales[static_cast<int64_t>(total_offset + chunk_idx) * num_scales + scales_idx] =
                     ld_nc_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * num_scales + scales_idx);
             }
@@ -589,7 +816,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             #pragma unroll 4
             for (int i = recv_thread_id_in_rank; i < num_recv_tokens * num_sf_scales_for_nvfp4; i += 32 * num_recv_warps_per_rank) {
                 int chunk_idx = i / num_sf_scales_for_nvfp4, sf_scales_idx = i % num_sf_scales_for_nvfp4;
-                int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
+                int token_idx_in_buffer = ring_slot(cached_channel_head_idx + chunk_idx);
                 recv_x_sf_scale_for_nvfp4[static_cast<int64_t>(total_offset + chunk_idx) * num_sf_scales_for_nvfp4 + sf_scales_idx] =
                     ld_nc_global(channel_x_sf_scale_for_nvfp4_buffers.buffer() + token_idx_in_buffer * num_sf_scales_for_nvfp4 + sf_scales_idx);
             }
@@ -606,17 +833,6 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         }
     }
 
-    // Clean unused `recv_topk_idx` as -1
-    if (num_worst_tokens > 0) {
-        auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
-        const auto num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank];
-        const auto clean_start = num_recv_tokens * num_topk + sm_id * kNumThreads;
-        const auto clean_end = num_worst_tokens * num_topk;
-        const auto clean_stride = num_sms * kNumThreads;
-        #pragma unroll
-        for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
-            recv_topk_idx[i] = -1;
-    }
 }
 
 void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
@@ -625,11 +841,23 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
               int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales, int num_sf_scales_for_nvfp4,
               int scale_token_stride, int scale_hidden_stride, int sf_scale_for_nvfp4_token_stride, int sf_scale_for_nvfp4_hidden_stride,
               void** buffer_ptrs, int rank, int num_ranks,
-              cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
+              cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens,
+              cudaStream_t local_stream) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 8192;
     const bool use_tma = hidden_int4 % 2 == 0 &&
         static_cast<int64_t>(hidden_int4 / 2) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp;
+    const char* fifo_env = std::getenv("DEEPEP_FIFO_OPTIMIZED");
+    const bool fifo_optimized = fifo_env && fifo_env[0] == '1' && fifo_env[1] == '\0' &&
+        num_ranks == 4;
+    // Keep the production interface to one optimized-path switch. Compile-time
+    // specializations below are implementation details selected by shape.
+    const bool local_bypass = fifo_optimized &&
+        env_flag_default("DEEPEP_LOCAL_BYPASS", true);
+    const bool compact_tma_shape = use_tma &&
+        static_cast<int64_t>(hidden_int4) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp;
+    const int scan_mode = fifo_optimized ? (compact_tma_shape ? 9 : 6) : 0;
+
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
@@ -639,7 +867,35 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
     EP_HOST_ASSERT(static_cast<int64_t>(num_sf_scales_for_nvfp4) * sf_scale_for_nvfp4_hidden_stride < std::numeric_limits<int>::max());
 
 #define DISPATCH_LAUNCH_CASE(ranks) { \
-    auto kernel = use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false>; \
+    if (local_stream != nullptr && local_bypass) { \
+    auto local_kernel = scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 9, 1> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 9, 1>) : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 6, 1> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 6, 1>) : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 0, 1> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 0, 1>); \
+    cfg.stream = local_stream; \
+    SET_SHARED_MEMORY_FOR_TMA(local_kernel); \
+    LAUNCH_KERNEL(&cfg, local_kernel, \
+        reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
+        send_head, reinterpret_cast<const int4*>(x), x_scales, sf_scale_for_nvfp4, topk_idx, topk_weights, \
+        is_token_in_rank, channel_prefix_matrix, \
+        num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4, \
+        scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride, \
+        buffer_ptrs, rank, num_max_send_tokens, num_recv_buffer_tokens); \
+    auto remote_kernel = scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 9, 2> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 9, 2>) : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 6, 2> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 6, 2>) : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 0, 2> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 0, 2>); \
+    cfg.stream = stream; \
+    SET_SHARED_MEMORY_FOR_TMA(remote_kernel); \
+    LAUNCH_KERNEL(&cfg, remote_kernel, \
+        reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
+        send_head, reinterpret_cast<const int4*>(x), x_scales, sf_scale_for_nvfp4, topk_idx, topk_weights, \
+        is_token_in_rank, channel_prefix_matrix, \
+        num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4, \
+        scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride, \
+        buffer_ptrs, rank, num_max_send_tokens, num_recv_buffer_tokens); \
+    } else { \
+    auto kernel = local_bypass \
+        ? (scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 9> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 9>) \
+           : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 6> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 6>) \
+           : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true>)) \
+        : (scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, false, 9> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, false, 9>) \
+           : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, false, 6> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, false, 6>) \
+           : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, false> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, false>)); \
     SET_SHARED_MEMORY_FOR_TMA(kernel); \
     LAUNCH_KERNEL(&cfg, kernel, \
         reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
@@ -649,159 +905,21 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
         scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride, \
         buffer_ptrs, rank, \
         num_max_send_tokens, num_recv_buffer_tokens); \
+    } \
     } break
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(num_sms % 2 == 0);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+#ifndef DISABLE_SM90_FEATURES
+    if (local_stream != nullptr) attr[0].val.cooperative = 0;
+#endif
     SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
 
-
-// Full-batch peer staging inside existing IPC buffer, followed by owned-output copy.
-// The next notify barrier prevents buffer reuse before all ranks finish copyout.
-template<int kRanks, int kThreads, bool kPaired>
-__global__ __launch_bounds__(kThreads, 1)
-void dense_dispatch_send(int* send_head, const int4* x, const float* scales, const float* sf,
-                         const int64_t* topk, const float* weights, const bool* selected,
-                         const int* prefixes, int tokens, int hidden_int4, int num_topk,
-                         int experts, int num_scales, int num_sf, int scale_ts, int scale_hs,
-                         int sf_ts, int sf_hs, void** buffers, int rank, size_t buffer_bytes) {
-    const int parity = blockIdx.x % 2;
-    if constexpr (!kPaired) {
-        if (parity) return;
-    }
-    const int channel = blockIdx.x / 2, channels = gridDim.x / 2;
-    const int thread = threadIdx.x, lane = get_lane_id();
-    constexpr int threads_per_rank = kThreads / kRanks;
-    constexpr int local_warps_per_rank = threads_per_rank / 32;
-    constexpr int warps_per_rank = local_warps_per_rank * (kPaired ? 2 : 1);
-    const int destination = thread / threads_per_rank;
-    const int local_warp = thread % threads_per_rank / 32;
-    // Pair members interleave ownership; both scan the same channel so ordinal
-    // counts/wire order remain identical. Every head (including -1) has one writer.
-    const int warp = kPaired ? local_warp * 2 + parity : local_warp;
-    auto peer = static_cast<uint8_t*>(buffers[destination]);
-    auto rank_prefix = reinterpret_cast<const int*>(peer);
-    const int rows = rank_prefix[(kRanks - 1) * kRanks + destination];
-    const DenseDispatchLayout layout(rows, static_cast<size_t>(hidden_int4) * sizeof(int4),
-                                    kRanks, channels, num_topk, num_scales, num_sf);
-    EP_DEVICE_ASSERT(layout.bytes <= buffer_bytes);
-    const int rank_offset = rank ? rank_prefix[(rank - 1) * kRanks + destination] : 0;
-    const int channel_offset = channel ? __ldg(prefixes + destination * channels + channel - 1) : 0;
-    const int base = rank_offset + channel_offset;
-    // Only the even member publishes channel metadata. The shared barrier is
-    // launched after the entire sender grid completes, including both members.
-    if (warp == 0 && elect_one_sync())
-        reinterpret_cast<int*>(peer + layout.channel)[rank * channels + channel] = channel_offset;
-    int begin, end;
-    get_channel_task_range(tokens, channels, channel, begin, end);
-    int count = 0;
-    for (int token = begin; token < end; ++token) {
-        const bool active = selected[token * kRanks + destination];
-        if (token % warps_per_rank == warp && elect_one_sync())
-            send_head[token * kRanks + destination] = active ? count : -1;
-        if (!active)
-            continue;
-        const int output = base + count++;
-        EP_DEVICE_ASSERT(output < rows);
-        if (count % warps_per_rank != warp)
-            continue;
-        auto payload = reinterpret_cast<int4*>(peer + layout.x) + static_cast<size_t>(output) * hidden_int4;
-        auto input = x + static_cast<size_t>(token) * hidden_int4;
-        UNROLLED_WARP_COPY(5, lane, hidden_int4, payload, input, __ldg, st_na_global);
-        if (elect_one_sync())
-            reinterpret_cast<int*>(peer + layout.source)[output] = token;
-        if (lane < num_topk) {
-            const int per_rank = experts / kRanks;
-            int64_t expert = __ldg(topk + static_cast<size_t>(token) * num_topk + lane);
-            expert = expert >= destination * per_rank && expert < (destination + 1) * per_rank
-                   ? expert - destination * per_rank : -1;
-            reinterpret_cast<int64_t*>(peer + layout.topk)[static_cast<size_t>(output) * num_topk + lane] = expert;
-            reinterpret_cast<float*>(peer + layout.weights)[static_cast<size_t>(output) * num_topk + lane]
-                = expert >= 0 ? __ldg(weights + static_cast<size_t>(token) * num_topk + lane) : 0.0f;
-        }
-        for (int i = lane; i < num_scales; i += 32)
-            reinterpret_cast<float*>(peer + layout.scales)[static_cast<size_t>(output) * num_scales + i]
-                = __ldg(scales + static_cast<size_t>(token) * scale_ts + i * scale_hs);
-        for (int i = lane; i < num_sf; i += 32)
-            reinterpret_cast<float*>(peer + layout.sf)[static_cast<size_t>(output) * num_sf + i]
-                = __ldg(sf + static_cast<size_t>(token) * sf_ts + i * sf_hs);
-    }
-    // All remote payload stores precede the subsequent system barrier launch.
-    memory_fence();
-}
-
-template<int kRanks>
-__global__ void dense_dispatch_copyout(int4* x, float* scales, float* sf, int* source,
-                                      int64_t* topk, float* weights, int* channels_out,
-                                      void** buffers, int rank, int channels, int capacity,
-                                      int hidden_int4, int num_topk, int num_scales, int num_sf,
-                                      size_t buffer_bytes) {
-    auto local = static_cast<const uint8_t*>(buffers[rank]);
-    const int rows = reinterpret_cast<const int*>(local)[(kRanks - 1) * kRanks + rank];
-    EP_DEVICE_ASSERT(rows <= capacity);
-    const DenseDispatchLayout layout(rows, static_cast<size_t>(hidden_int4) * sizeof(int4),
-                                    kRanks, channels, num_topk, num_scales, num_sf);
-    EP_DEVICE_ASSERT(layout.bytes <= buffer_bytes);
-    const size_t thread = blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t step = gridDim.x * blockDim.x;
-    for (size_t i = thread; i < static_cast<size_t>(rows) * hidden_int4; i += step)
-        x[i] = ld_nc_global(reinterpret_cast<const int4*>(local + layout.x) + i);
-    for (size_t i = thread; i < static_cast<size_t>(rows); i += step)
-        source[i] = __ldg(reinterpret_cast<const int*>(local + layout.source) + i);
-    for (size_t i = thread; i < static_cast<size_t>(capacity) * num_topk; i += step) {
-        if (i < static_cast<size_t>(rows) * num_topk) {
-            topk[i] = __ldg(reinterpret_cast<const int64_t*>(local + layout.topk) + i);
-            weights[i] = __ldg(reinterpret_cast<const float*>(local + layout.weights) + i);
-        } else {
-            topk[i] = -1;
-        }
-    }
-    for (size_t i = thread; i < static_cast<size_t>(rows) * num_scales; i += step)
-        scales[i] = __ldg(reinterpret_cast<const float*>(local + layout.scales) + i);
-    for (size_t i = thread; i < static_cast<size_t>(rows) * num_sf; i += step)
-        sf[i] = __ldg(reinterpret_cast<const float*>(local + layout.sf) + i);
-    for (size_t i = thread; i < static_cast<size_t>(kRanks) * channels; i += step)
-        channels_out[i] = __ldg(reinterpret_cast<const int*>(local + layout.channel) + i);
-}
-
-void dense_dispatch(void* recv_x, float* recv_x_scales, float* recv_sf, int* recv_src,
-                    int64_t* recv_topk, float* recv_weights, int* recv_channels, int* send_head,
-                    const void* x, const float* x_scales, const float* sf,
-                    const int64_t* topk, const float* weights, const bool* selected,
-                    const int* channel_prefix, int tokens, int output_capacity, int hidden_int4,
-                    int num_topk, int experts, int scales, int num_sf, int scale_ts, int scale_hs,
-                    int sf_ts, int sf_hs, void** buffers, int** signals, int rank, int ranks,
-                    size_t buffer_bytes, cudaStream_t stream, int sms, bool skip_copyout) {
-    EP_HOST_ASSERT(sms == 20 && (ranks == 2 || ranks == 4));
-    EP_HOST_ASSERT(num_topk <= 32);
-    constexpr int threads = 768;
-    const char* paired_setting = std::getenv("DEEPEP_DENSE_PAIR_SENDER");
-    const bool paired = paired_setting && paired_setting[0] == '1' && paired_setting[1] == '\0';
-    SETUP_LAUNCH_CONFIG(sms, threads, stream);
-#define DENSE_LAUNCH_CASE(n) \
-    auto kernel = paired ? dense_dispatch_send<n, threads, true> : dense_dispatch_send<n, threads, false>; \
-    LAUNCH_KERNEL(&cfg, kernel, send_head, static_cast<const int4*>(x), x_scales, sf, \
-        topk, weights, selected, channel_prefix, tokens, hidden_int4, num_topk, experts, scales, num_sf, \
-        scale_ts, scale_hs, sf_ts, sf_hs, buffers, rank, buffer_bytes); \
-    break
-    switch (ranks) { case 2: { DENSE_LAUNCH_CASE(2); } case 4: { DENSE_LAUNCH_CASE(4); } default: EP_HOST_ASSERT(false); }
-#undef DENSE_LAUNCH_CASE
-    barrier(signals, rank, ranks, stream);
-    if (skip_copyout)
-        return;
-#define DENSE_COPY_CASE(n) \
-    LAUNCH_KERNEL(&cfg, dense_dispatch_copyout<n>, static_cast<int4*>(recv_x), recv_x_scales, recv_sf, recv_src, \
-        recv_topk, recv_weights, recv_channels, buffers, rank, sms / 2, output_capacity, hidden_int4, \
-        num_topk, scales, num_sf, buffer_bytes); \
-    break
-    switch (ranks) { case 2: { DENSE_COPY_CASE(2); } case 4: { DENSE_COPY_CASE(4); } default: EP_HOST_ASSERT(false); }
-#undef DENSE_COPY_CASE
-}
-
-template<int kNumRanks>
+// A control-only collective: no payload allocation and no queue polling.
+template<int kNumRanks, bool kParallelHeads = false>
 __global__ void
 cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int,
                       int** barrier_signal_ptrs, int rank) {
@@ -836,7 +954,21 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
             int token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
-            for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++ i) {
+            if constexpr (kParallelHeads) {
+                // Reverse token order: the closest valid lane at or below the
+                // current lane is the next routed token. A ballot replaces the
+                // five-step inclusive shuffle scan while preserving carry.
+                const unsigned valid_heads = __ballot_sync(0xffffffff, current_head >= 0);
+                const unsigned through_lane = valid_heads & (0xffffffffu >> (31 - lane_id));
+                int previous_lane = -1;
+                if (through_lane) previous_lane = 31 - static_cast<int>(__clz(through_lane));
+                const int next_head = __shfl_sync(0xffffffff, current_head, max(0, previous_lane));
+                expected_head = -(previous_lane >= 0 ? next_head : last_head) - 1;
+                int carry_lane = -1;
+                if (valid_heads) carry_lane = 31 - static_cast<int>(__clz(valid_heads));
+                const int carry_head = __shfl_sync(0xffffffff, current_head, max(0, carry_lane));
+                if (carry_lane >= 0) last_head = carry_head;
+            } else for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++ i) {
                 const int head = __shfl_sync(0xffffffff, current_head, i);
                 if (head < 0) {
                     if (lane_id == i)
@@ -855,11 +987,15 @@ void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
                            int num_recv_tokens, int num_memset_int,
                            int** barrier_signal_ptrs, int rank, int num_ranks,
                            cudaStream_t stream) {
-#define CACHED_NOTIFY_COMBINE(ranks) \
-    LAUNCH_KERNEL(&cfg, cached_notify_combine<ranks>, \
+#define CACHED_NOTIFY_COMBINE(ranks) { \
+    auto kernel = parallel_heads ? cached_notify_combine<ranks, true> : cached_notify_combine<ranks, false>; \
+    LAUNCH_KERNEL(&cfg, kernel, \
         buffer_ptrs, send_head, num_channels, num_recv_tokens, num_memset_int, barrier_signal_ptrs, rank); \
-    break
+    } break
 
+    const char* fifo_setting = std::getenv("DEEPEP_FIFO_OPTIMIZED");
+    const bool parallel_heads = fifo_setting && fifo_setting[0] == '1' && fifo_setting[1] == '\0' &&
+        num_ranks == 4 && num_channels == 10;
     const int num_threads = std::max(128, 32 * num_ranks);
     EP_HOST_ASSERT(num_ranks <= num_threads);
     EP_HOST_ASSERT(num_threads <= 1024);
@@ -869,7 +1005,10 @@ void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
 #undef CACHED_NOTIFY_COMBINE
 }
 
-template<typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kGlobalStore = false>
+template<typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp,
+         bool kGlobalStore = false,
+         bool kBalancedSender = false, bool kLocalBypass = false,
+         bool kSingleSourceFast = false, bool kNoBiasFast = false, int kRouteMode = 0>
 __global__ void __launch_bounds__(kNumThreads, 1)
 combine(dtype_t* recv_x, float* recv_topk_weights,
         const dtype_t* x, const float* topk_weights,
@@ -878,12 +1017,23 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
         void** buffer_ptrs, int rank,
         int num_max_send_tokens, int num_recv_buffer_tokens) {
-    const auto num_sms = static_cast<int>(gridDim.x);
+    const auto num_sms = static_cast<int>(gridDim.x) * (kRouteMode ? 2 : 1);
     const auto thread_id = static_cast<int>(threadIdx.x);
-    const auto sm_id = static_cast<int>(blockIdx.x), lane_id = get_lane_id();
+    const auto sm_id = static_cast<int>(blockIdx.x) * (kRouteMode ? 2 : 1) + (kRouteMode == 2), lane_id = get_lane_id();
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
+    if constexpr (kRouteMode == 1) { if (!is_sender) return; }
+    if constexpr (kRouteMode == 2) { if (is_sender) return; }
     const int responsible_channel = sm_id / 2;
+    const bool recv_buffer_is_power_of_two =
+        (num_recv_buffer_tokens & (num_recv_buffer_tokens - 1)) == 0;
+    auto ring_slot = [&](int ordinal) {
+        if constexpr (kGlobalStore || kLocalBypass)
+            return ordinal & (num_recv_buffer_tokens - 1);
+        return recv_buffer_is_power_of_two
+            ? ordinal & (num_recv_buffer_tokens - 1)
+            : ordinal % num_recv_buffer_tokens;
+    };
     EP_DEVICE_ASSERT(num_topk <= 32);
 
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
@@ -903,14 +1053,75 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
     if (is_sender) {
         // Workers for sending
         // Several warps are responsible for a single rank
-        constexpr int num_send_warps_per_rank = (kNumThreads / 32) / kNumRanks;
-        constexpr int num_send_warps = num_send_warps_per_rank * kNumRanks;
-        const auto num_threads_per_rank = num_send_warps_per_rank * 32;
+        int num_send_warps_per_rank = (kNumThreads / 32) / kNumRanks;
+        constexpr int num_send_warps = kNumThreads / 32;
+        int num_threads_per_rank = num_send_warps_per_rank * 32;
         const auto send_thread_id = thread_id;
         const auto send_warp_id = send_thread_id / 32;
-        const auto send_rank_id = (responsible_channel + send_warp_id) % kNumRanks;
-        const auto send_warp_id_in_rank = send_warp_id / kNumRanks;
+        int send_rank_id = (responsible_channel + send_warp_id) % kNumRanks;
+        int send_warp_id_in_rank = send_warp_id / kNumRanks;
+        if constexpr (kRouteMode == 1 && kNumRanks == 4) {
+            // Spend all sender warps on the three remote peers.
+            num_send_warps_per_rank = num_send_warps / (kNumRanks - 1);
+            num_threads_per_rank = num_send_warps_per_rank * 32;
+            const int peer = (responsible_channel + send_warp_id) % (kNumRanks - 1);
+            send_rank_id = peer + (peer >= rank);
+            send_warp_id_in_rank = send_warp_id / (kNumRanks - 1);
+        }
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
+
+        if constexpr (kBalancedSender) {
+            int rows[kNumRanks];
+            int total_rows = 0;
+            #pragma unroll
+            for (int peer = 0; peer < kNumRanks; ++peer) {
+                const int begin = peer ? rank_prefix_matrix[(peer - 1) * kNumRanks + rank] : 0;
+                const int count = rank_prefix_matrix[peer * kNumRanks + rank] - begin;
+                const int channel_begin = channel_prefix_matrix[peer * num_channels + responsible_channel];
+                const int channel_end = responsible_channel + 1 == num_channels ? count :
+                    channel_prefix_matrix[peer * num_channels + responsible_channel + 1];
+                rows[peer] = channel_end - channel_begin;
+                total_rows += rows[peer];
+            }
+            if (total_rows > 0) {
+                constexpr int extra = num_send_warps - kNumRanks;
+                int warps[kNumRanks];
+                int64_t remainders[kNumRanks];
+                int remaining = num_send_warps;
+                #pragma unroll
+                for (int peer = 0; peer < kNumRanks; ++peer) {
+                    const int64_t scaled = static_cast<int64_t>(rows[peer]) * extra;
+                    warps[peer] = 1 + static_cast<int>(scaled / total_rows);
+                    remainders[peer] = scaled % total_rows;
+                    remaining -= warps[peer];
+                }
+                #pragma unroll
+                for (int peer = 0; peer < kNumRanks; ++peer) {
+                    int priority = 0;
+                    #pragma unroll
+                    for (int other = 0; other < kNumRanks; ++other)
+                        priority += remainders[other] > remainders[peer] ||
+                            (remainders[other] == remainders[peer] && other < peer);
+                    warps[peer] += priority < remaining;
+                }
+                int first = 0;
+                #pragma unroll
+                for (int peer = 0; peer < kNumRanks; ++peer) {
+                    if (send_warp_id >= first && send_warp_id < first + warps[peer]) {
+                        send_rank_id = peer;
+                        send_warp_id_in_rank = send_warp_id - first;
+                        num_send_warps_per_rank = warps[peer];
+                        num_threads_per_rank = warps[peer] * 32;
+                    }
+                    first += warps[peer];
+                }
+            }
+        }
+        const bool local_destination = kLocalBypass && send_rank_id == rank;
+        // Local rows are read directly by the receiver during reduction. The
+        // local sender group has no queue, payload, or tail update to perform.
+        if (local_destination)
+            return;
 
         // Calculate pointers by the specific layout
         auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
@@ -943,6 +1154,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
+            if (!local_destination) {
             if (elect_one_sync()) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
@@ -958,24 +1170,27 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 }
             }
             __syncwarp();
+            }
 
             // Send by chunk
             #pragma unroll
             for (int i = send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank) {
                 // Get an empty slot
-                int dst_slot_idx = (current_channel_tail_idx + i) % num_recv_buffer_tokens;
+                int dst_slot_idx = ring_slot(current_channel_tail_idx + i);
 
                 // Copy data
-                auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
-                auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
-                UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
+                if (!local_destination) {
+                    auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
+                    auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
+                    UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
+                }
 
                 // Send source index
-                if (elect_one_sync())
+                if (!local_destination && elect_one_sync())
                     channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + token_idx + i);
 
                 // Send `topk_weights`
-                if (num_topk > 0 and lane_id < num_topk)
+                if (!local_destination && num_topk > 0 and lane_id < num_topk)
                     channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
             }
             token_idx += num_round_tokens;
@@ -983,7 +1198,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
             // Move tail index
             asm volatile("bar.sync %0, %1;" :: "r"(send_rank_id), "r"(num_threads_per_rank));
-            if (send_warp_id_in_rank == 0 and elect_one_sync())
+            if (!local_destination && send_warp_id_in_rank == 0 && elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
@@ -1012,7 +1227,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
             // Queue head updater
             int last_head = 0;
-            while (lane_id < kNumRanks) {
+            while (lane_id < kNumRanks && !(kLocalBypass && lane_id == rank)) {
                 // Check retired
                 bool retired = true;
                 #pragma unroll
@@ -1060,16 +1275,27 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             // The same tokens as the dispatch process
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_recv_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
+            int local_row_base = 0;
+            if constexpr (kLocalBypass) {
+                const int local_rank_offset = rank > 0
+                    ? __ldg(rank_prefix_matrix + (rank - 1) * kNumRanks + rank)
+                    : 0;
+                const int local_channel_offset = __ldg(
+                    channel_prefix_matrix + rank * num_channels + responsible_channel);
+                local_row_base = local_rank_offset + local_channel_offset;
+            }
 
             // Iterate over all tokens and combine
             for (int64_t token_idx = token_start_idx + recv_warp_id - 1; token_idx < token_end_idx; token_idx += num_recv_warps - 1) {
                 // Read expected head
                 int expected_head = -1;
                 if (lane_id < kNumRanks)
-                    expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
+                    expected_head = __ldg(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = clock64();
-                while (__any_sync(0xffffffff, expected_head >= 0 and channel_tail_idx[lane_id] <= expected_head)) {
+                while (__any_sync(0xffffffff, expected_head >= 0 and
+                                  !(kLocalBypass && lane_id == rank) &&
+                                  channel_tail_idx[lane_id] <= expected_head)) {
                     // Timeout check
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n", rank, responsible_channel, expected_head);
@@ -1079,13 +1305,68 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 __syncwarp();
 
                 // Broadcast current heads
-                int num_topk_ranks = 0, topk_ranks[kNumRanks], slot_indices[kNumRanks];
+                int num_topk_ranks = 0, topk_ranks[kNumRanks];
+                int slot_indices[kNumRanks], local_row_indices[kNumRanks];
                 #pragma unroll
                 for (int i = 0; i < kNumRanks; ++ i) {
                     auto expected_head_i = __shfl_sync(0xffffffff, expected_head, i);
                     if (expected_head_i >= 0) {
-                        slot_indices[num_topk_ranks] = expected_head_i % num_recv_buffer_tokens;
+                        if constexpr (kLocalBypass) {
+                            if (i == rank) {
+                                local_row_indices[num_topk_ranks] = local_row_base + expected_head_i;
+                                slot_indices[num_topk_ranks] = 0;
+                            } else {
+                                local_row_indices[num_topk_ranks] = 0;
+                                slot_indices[num_topk_ranks] = ring_slot(expected_head_i);
+                            }
+                        } else {
+                            slot_indices[num_topk_ranks] = ring_slot(expected_head_i);
+                            local_row_indices[num_topk_ranks] = 0;
+                        }
                         topk_ranks[num_topk_ranks ++] = i;
+                    }
+                }
+
+                // A single contribution needs no general multi-rank reduction.
+                if constexpr (kSingleSourceFast) {
+                    if (num_topk_ranks == 1) {
+                        const int source_rank = topk_ranks[0];
+                        const bool is_local = source_rank == rank;
+                        const int source_row = local_row_indices[0];
+                        for (int i = lane_id; i < hidden_int4; i += 32) {
+                            const int4 input_value = is_local
+                                ? __ldg(x_int4 + static_cast<int64_t>(source_row) * hidden_int4 + i)
+                                : ld_nc_global(channel_x_buffers[source_rank].buffer() + slot_indices[0] * hidden_int4 + i);
+                            if constexpr (kNoBiasFast) {
+                                recv_int4[token_idx * hidden_int4 + i] = input_value;
+                                continue;
+                            }
+                            const int4 bias_0_value = bias_0_int4 != nullptr
+                                ? __ldg(bias_0_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
+                            const int4 bias_1_value = bias_1_int4 != nullptr
+                                ? __ldg(bias_1_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
+                            auto input_dtypes = reinterpret_cast<const dtype_t*>(&input_value);
+                            auto bias_0_dtypes = reinterpret_cast<const dtype_t*>(&bias_0_value);
+                            auto bias_1_dtypes = reinterpret_cast<const dtype_t*>(&bias_1_value);
+                            int4 output_value;
+                            auto output_dtypes = reinterpret_cast<dtype_t*>(&output_value);
+                            #pragma unroll
+                            for (int j = 0; j < kDtypePerInt4; ++j)
+                                output_dtypes[j] = static_cast<dtype_t>(
+                                    static_cast<float>(bias_0_dtypes[j]) +
+                                    static_cast<float>(bias_1_dtypes[j]) +
+                                    static_cast<float>(input_dtypes[j]));
+                            recv_int4[token_idx * hidden_int4 + i] = output_value;
+                        }
+                        if (lane_id < num_topk)
+                            recv_topk_weights[token_idx * num_topk + lane_id] =
+                                is_local
+                                    ? __ldg(topk_weights + static_cast<int64_t>(source_row) * num_topk + lane_id)
+                                    : ld_nc_global(channel_topk_weights_buffers[source_rank].buffer() + slot_indices[0] * num_topk + lane_id);
+                        if (lane_id < kNumRanks)
+                            warp_channel_head_idx[recv_warp_id][lane_id] =
+                                (expected_head < 0) ? -expected_head - 1 : expected_head + 1;
+                        continue;
                     }
                 }
 
@@ -1102,24 +1383,36 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 EP_STATIC_ASSERT(kNumStages * 32 * sizeof(int4) <= kNumTMABytesPerWarp, "Invalid count");
                 #pragma unroll
                 for (int i = lane_id; i < hidden_int4; i += 32) {
-                    // Read bias
-                    // TODO: make it as a template
-                    int4 bias_0_value_int4 = bias_0_int4 != nullptr ? __ldg(bias_0_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
-                    int4 bias_1_value_int4 = bias_1_int4 != nullptr ? __ldg(bias_1_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
-
                     // Read buffers
                     int4 recv_value_int4[kNumRanks];
                     #pragma unroll
-                    for (int j = 0; j < num_topk_ranks; ++ j)
-                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
+                    for (int j = 0; j < num_topk_ranks; ++ j) {
+                        if constexpr (kLocalBypass) {
+                            recv_value_int4[j] = topk_ranks[j] == rank
+                                ? __ldg(x_int4 + static_cast<int64_t>(local_row_indices[j]) * hidden_int4 + i)
+                                : ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
+                        } else {
+                            recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
+                        }
+                    }
 
-                    // Reduce bias
                     float values[kDtypePerInt4];
-                    auto bias_0_values = reinterpret_cast<const dtype_t*>(&bias_0_value_int4);
-                    auto bias_1_values = reinterpret_cast<const dtype_t*>(&bias_1_value_int4);
-                    #pragma unroll
-                    for (int j = 0; j < kDtypePerInt4; ++ j)
-                        values[j] = static_cast<float>(bias_0_values[j]) + static_cast<float>(bias_1_values[j]);
+                    if constexpr (kNoBiasFast) {
+                        #pragma unroll
+                        for (int j = 0; j < kDtypePerInt4; ++j)
+                            values[j] = 0.0f;
+                    } else {
+                        // Read and reduce bias only when the caller supplied it.
+                        int4 bias_0_value_int4 = bias_0_int4 != nullptr
+                            ? __ldg(bias_0_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
+                        int4 bias_1_value_int4 = bias_1_int4 != nullptr
+                            ? __ldg(bias_1_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
+                        auto bias_0_values = reinterpret_cast<const dtype_t*>(&bias_0_value_int4);
+                        auto bias_1_values = reinterpret_cast<const dtype_t*>(&bias_1_value_int4);
+                        #pragma unroll
+                        for (int j = 0; j < kDtypePerInt4; ++j)
+                            values[j] = static_cast<float>(bias_0_values[j]) + static_cast<float>(bias_1_values[j]);
+                    }
 
                     // Reduce all-to-all results
                     #pragma unroll
@@ -1170,8 +1463,15 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 if (lane_id < num_topk) {
                     float value = 0;
                     #pragma unroll
-                    for (int i = 0; i < num_topk_ranks; ++ i)
-                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
+                    for (int i = 0; i < num_topk_ranks; ++ i) {
+                        if constexpr (kLocalBypass) {
+                            value += topk_ranks[i] == rank
+                                ? __ldg(topk_weights + static_cast<int64_t>(local_row_indices[i]) * num_topk + lane_id)
+                                : ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
+                        } else {
+                            value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
+                        }
+                    }
                     recv_topk_weights[token_idx * num_topk + lane_id] = value;
                 }
 
@@ -1196,18 +1496,76 @@ void combine(cudaDataType_t type,
              int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
              void** buffer_ptrs, int rank, int num_ranks,
              cudaStream_t stream, int num_sms,
-             int num_max_send_tokens, int num_recv_buffer_tokens) {
+             int num_max_send_tokens, int num_recv_buffer_tokens,
+             cudaStream_t local_stream) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 4096;
-    const char* global_setting = std::getenv("DEEPEP_COMBINE_GLOBAL_STORE");
-    const bool global_store = global_setting && global_setting[0] == '1' && global_setting[1] == '\0' &&
-        (num_ranks == 2 || num_ranks == 4);
+    const char* fifo_setting = std::getenv("DEEPEP_FIFO_OPTIMIZED");
+    const bool fifo_optimized = fifo_setting && fifo_setting[0] == '1' && fifo_setting[1] == '\0' &&
+        num_ranks == 4;
+    const bool global_store = (num_ranks == 2 || num_ranks == 4) &&
+        fifo_optimized;
+    const bool balanced_sender = fifo_optimized &&
+        env_flag_default("DEEPEP_COMBINE_BALANCED_SEND", false);
+    const bool local_bypass = num_ranks == 4 && fifo_optimized &&
+        env_flag_default("DEEPEP_COMBINE_LOCAL_BYPASS", true);
+    const bool no_bias_fast = local_bypass && bias_0 == nullptr && bias_1 == nullptr;
+    // Increase receiver latency hiding within the same ten-CTA grid for the
+    // measured QMSum shape. Other shapes/configurations keep their old default.
+    // The queue must also cover the lag between 31 interleaved consumers;
+    // otherwise a sender waiting for a whole chunk can block their progress.
+    const bool wide_recv_safe = num_recv_buffer_tokens - num_max_send_tokens >= 1024 / 32 - 2;
+    const int recv_threads = wide_recv_safe && env_flag_default("DEEPEP_COMBINE_RECV_1024",
+        no_bias_fast && hidden == 3072 && num_sms == 20) ? 1024 : kNumThreads;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks) { \
     auto kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true> : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false>; \
+    if constexpr (ranks == 4) { \
+        if (balanced_sender) { \
+            kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, true> : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false, true>; \
+        } \
+        if (local_bypass && !balanced_sender) { \
+            if (no_bias_fast) kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true, true> : \
+                combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false, false, true, true, true>; \
+            else kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true> : \
+                combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false, false, true, true>; \
+        } \
+    } \
+    if (local_stream != nullptr && local_bypass) { \
+        auto local_kernel = no_bias_fast ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true, true, 2> : \
+            combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true, false, 2>; \
+        if (recv_threads == 1024) local_kernel = no_bias_fast ? \
+            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, true, false, true, true, true, 2> : \
+            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, true, false, true, true, false, 2>; \
+        /* Load both kernels before the sender can block on FIFO progress. */ \
+        SET_SHARED_MEMORY_FOR_TMA(local_kernel); \
+        kernel = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, false, false, 1>; \
+    SET_SHARED_MEMORY_FOR_TMA(kernel); \
+    cfg.dynamicSmemBytes = 0; \
+    LAUNCH_KERNEL(&cfg, kernel, \
+        reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
+        reinterpret_cast<const dtype*>(x), topk_weights,   \
+        reinterpret_cast<const dtype*>(bias_0), reinterpret_cast<const dtype*>(bias_1), \
+        src_idx, rank_prefix_matrix, channel_prefix_matrix, \
+        send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
+        buffer_ptrs, rank, \
+        num_max_send_tokens, num_recv_buffer_tokens); \
+        cfg.stream = local_stream; \
+        kernel = local_kernel; \
+        cfg.blockDim.x = recv_threads; \
+    LAUNCH_KERNEL(&cfg, kernel, \
+        reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
+        reinterpret_cast<const dtype*>(x), topk_weights,   \
+        reinterpret_cast<const dtype*>(bias_0), reinterpret_cast<const dtype*>(bias_1), \
+        src_idx, rank_prefix_matrix, channel_prefix_matrix, \
+        send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
+        buffer_ptrs, rank, \
+        num_max_send_tokens, num_recv_buffer_tokens); \
+        cfg.stream = stream; \
+    } else { \
     SET_SHARED_MEMORY_FOR_TMA(kernel); \
     LAUNCH_KERNEL(&cfg, kernel, \
         reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
@@ -1216,7 +1574,8 @@ void combine(cudaDataType_t type,
         src_idx, rank_prefix_matrix, channel_prefix_matrix, \
         send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
         buffer_ptrs, rank, \
-        num_max_send_tokens, num_recv_buffer_tokens); } \
+        num_max_send_tokens, num_recv_buffer_tokens); \
+    } } \
     break
 #define COMBINE_DTYPE_LAUNCH_CASE(dtype) SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE); break
 
@@ -1224,6 +1583,15 @@ void combine(cudaDataType_t type,
     EP_HOST_ASSERT(num_sms % 2 == 0);
     EP_HOST_ASSERT(kNumThreads >= num_ranks * 32);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+#ifndef DISABLE_SM90_FEATURES
+    if (local_stream != nullptr) {
+        // No grid synchronization or paired sender/receiver block cluster is
+        // needed for split kernels. The two grids together retain num_sms CTAs.
+        attr[0].val.cooperative = 0;
+        attr[1].val.clusterDim.x = 1;
+        cfg.gridDim.x = num_sms / 2;
+    }
+#endif
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE
@@ -1231,124 +1599,6 @@ void combine(cudaDataType_t type,
 
 // Push each remote contribution into its origin's shared buffer. The origin
 // reduces local HBM reads; local contributions bypass staging entirely.
-__global__ void staged_combine_push(const int4* input, const float* weights,
-    const int* src_idx, const int* rank_prefix, int input_tokens, int hidden_int4,
-    int topk, int source_capacity, void** buffers, int rank) {
-    const int lane = threadIdx.x & 31;
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int stride = gridDim.x * blockDim.x / 32;
-    const int64_t weights_offset = 4096LL + static_cast<int64_t>(4 * source_capacity) * hidden_int4 * sizeof(int4);
-    // Worst-token dispatch can pad x/src_idx beyond the actual received rows.
-    // Only rank-prefix rows contain initialized source indices.
-    input_tokens = min(input_tokens, __ldg(rank_prefix + 3 * 4 + rank));
-    for (int row = warp; row < input_tokens; row += stride) {
-        int origin = 0;
-        #pragma unroll
-        for (int src = 0; src < 3; ++src)
-            origin += row >= __ldg(rank_prefix + src * 4 + rank);
-        if (origin == rank) continue;
-        const int token = __ldg(src_idx + row);
-        EP_DEVICE_ASSERT(token >= 0 && token < source_capacity);
-        auto target = static_cast<uint8_t*>(buffers[origin]);
-        const int64_t slot = static_cast<int64_t>(rank) * source_capacity + token;
-        auto destination = reinterpret_cast<int4*>(target + 4096) + slot * hidden_int4;
-        auto source = input + static_cast<int64_t>(row) * hidden_int4;
-        UNROLLED_WARP_COPY(5, lane, hidden_int4, destination, source, __ldg, st_na_global);
-        if (lane < topk)
-            st_na_global(reinterpret_cast<float*>(target + weights_offset) + slot * topk + lane,
-                         __ldg(weights + static_cast<int64_t>(row) * topk + lane));
-    }
-    __threadfence_system();
-}
-
-__global__ void staged_combine_barrier(int** barriers, int rank) {
-    barrier_block<4>(barriers, rank);
-}
-
-__global__ void staged_combine_reduce(
-    int4* output, float* output_weights, const int4* bias0, const int4* bias1,
-    const int* heads, int tokens, int hidden_int4, int topk, int channels,
-    int capacity, void** buffers, int rank, const int4* input, const float* input_weights,
-    const int* rank_prefix, const int* channel_prefix) {
-    const int lane = threadIdx.x & 31;
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int stride = gridDim.x * blockDim.x / 32;
-    const int tokens_per_channel = max(1, (tokens + channels - 1) / channels);
-    const int64_t weight_offset = 4096LL + static_cast<int64_t>(capacity) * hidden_int4 * sizeof(int4);
-    for (int token = warp; token < tokens; token += stride) {
-        const int channel = token / tokens_per_channel;
-        int offset = -1;
-        if (lane < 4 && __ldg(heads + static_cast<int64_t>(token) * 4 + lane) >= 0) {
-            if (lane == rank) {
-                const int rank_begin = rank ? __ldg(rank_prefix + (rank - 1) * 4 + rank) : 0;
-                offset = rank_begin + __ldg(channel_prefix + rank * channels + channel) +
-                    __ldg(heads + static_cast<int64_t>(token) * 4 + rank);
-            } else offset = lane * (capacity / 4) + token;
-        }
-        int offsets[4];
-        #pragma unroll
-        for (int src = 0; src < 4; ++src)
-            offsets[src] = __shfl_sync(0xffffffff, offset, src);
-        for (int column = lane; column < hidden_int4; column += 32) {
-            const int64_t output_index = static_cast<int64_t>(token) * hidden_int4 + column;
-            int4 b0 = bias0 ? __ldg(bias0 + output_index) : make_int4(0, 0, 0, 0);
-            int4 b1 = bias1 ? __ldg(bias1 + output_index) : make_int4(0, 0, 0, 0);
-            float values[8];
-            #pragma unroll
-            for (int k = 0; k < 8; ++k)
-                values[k] = static_cast<float>(reinterpret_cast<nv_bfloat16*>(&b0)[k]) +
-                            static_cast<float>(reinterpret_cast<nv_bfloat16*>(&b1)[k]);
-            #pragma unroll
-            for (int src = 0; src < 4; ++src) if (offsets[src] >= 0) {
-                const auto payload = reinterpret_cast<const int4*>(static_cast<const uint8_t*>(buffers[rank]) + 4096);
-                int4 value = __ldg((src == rank ? input : payload) + static_cast<int64_t>(offsets[src]) * hidden_int4 + column);
-                #pragma unroll
-                for (int k = 0; k < 8; ++k)
-                    values[k] += static_cast<float>(reinterpret_cast<nv_bfloat16*>(&value)[k]);
-            }
-            int4 result;
-            #pragma unroll
-            for (int k = 0; k < 8; ++k)
-                reinterpret_cast<nv_bfloat16*>(&result)[k] = static_cast<nv_bfloat16>(values[k]);
-            st_na_global(output + output_index, result);
-        }
-        if (lane < topk) {
-            float sum = 0;
-            #pragma unroll
-            for (int src = 0; src < 4; ++src) if (offsets[src] >= 0) {
-                auto weights = reinterpret_cast<const float*>(static_cast<const uint8_t*>(buffers[rank]) + weight_offset);
-                sum += __ldg((src == rank ? input_weights : weights) + static_cast<int64_t>(offsets[src]) * topk + lane);
-            }
-            output_weights[static_cast<int64_t>(token) * topk + lane] = sum;
-        }
-    }
-}
-
-void staged_combine_bf16(void* output, float* output_weights,
-                         const void* bias0, const void* bias1,
-                         const int* send_head, const int* src_idx, const int* rank_prefix,
-                         const int* channel_prefix, const void* input, const float* weights,
-                         int input_tokens, int tokens, int hidden, int topk,
-                         int channels, int capacity, void** buffers,
-                         int** barriers, int rank, cudaStream_t stream, int sms) {
-    EP_HOST_ASSERT(tokens <= capacity / 4);
-    SETUP_LAUNCH_CONFIG(1, 128, stream);
-    cudaLaunchConfig_t payload_cfg = {dim3(sms), dim3(768), 0, stream, nullptr, 0};
-    LAUNCH_KERNEL(&payload_cfg, staged_combine_push, static_cast<const int4*>(input),
-        weights, src_idx, rank_prefix, input_tokens, hidden / 8, topk,
-        capacity / 4, buffers, rank);
-    LAUNCH_KERNEL(&cfg, staged_combine_barrier, barriers, rank);
-    cudaLaunchConfig_t reduce_cfg = {dim3(sms), dim3(768), 0, stream, nullptr, 0};
-    LAUNCH_KERNEL(&reduce_cfg, staged_combine_reduce,
-        static_cast<int4*>(output), output_weights,
-        static_cast<const int4*>(bias0), static_cast<const int4*>(bias1),
-        send_head, tokens, hidden / 8, topk, channels, capacity, buffers, rank,
-        static_cast<const int4*>(input), weights, rank_prefix, channel_prefix);
-    // A caller can immediately reuse this buffer after combine returns.
-    LAUNCH_KERNEL(&cfg, staged_combine_barrier, barriers, rank);
-}
-
-
 } // namespace intranode
 
 } // namespace deep_ep

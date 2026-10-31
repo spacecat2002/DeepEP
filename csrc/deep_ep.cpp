@@ -1,10 +1,10 @@
-#include "kernels/dense_dispatch_layout.cuh"
 // Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDADataType.h>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <memory>
 #include <pybind11/functional.h>
@@ -13,6 +13,19 @@
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
+
+namespace {
+bool env_flag(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+bool env_flag_default(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? default_value : value[0] == '1' && value[1] == '\0';
+}
+
+}  // namespace
 
 namespace shared_memory {
 void cu_mem_set_access_all(void* ptr, size_t size) {
@@ -143,6 +156,7 @@ Buffer::Buffer(int rank,
       disable_nvlink_for_normal_mode(disable_nvlink_for_normal_mode),
       explicitly_destroy(explicitly_destroy),
       comm_stream(at::cuda::getStreamFromPool(true)),
+      local_stream(at::cuda::getStreamFromPool(true)),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -406,7 +420,8 @@ void Buffer::sync(const std::vector<int> &device_ids,
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
-                            std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
+                            std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream,
+                            bool reuse_workspace) {
     EP_HOST_ASSERT(topk_idx.dim() == 2);
     EP_HOST_ASSERT(topk_idx.is_contiguous());
     EP_HOST_ASSERT(num_experts > 0);
@@ -427,12 +442,38 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
     }
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
-    auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+    const bool reuse_layout = reuse_workspace && !env_flag("DEEPEP_DISABLE_LAYOUT_CACHE");
+    auto layout_int_options = dtype(torch::kInt32).device(torch::kCUDA);
+    if (reuse_layout && (!layout_num_tokens_per_rank_cache.defined() ||
+        layout_num_tokens_per_rank_cache.size(0) != num_ranks))
+        layout_num_tokens_per_rank_cache = torch::empty({num_ranks}, layout_int_options);
+    auto num_tokens_per_rank = reuse_layout ? layout_num_tokens_per_rank_cache
+                                            : torch::empty({num_ranks}, layout_int_options);
     auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
-    auto num_tokens_per_expert = torch::empty({num_experts}, dtype(torch::kInt32).device(torch::kCUDA));
-    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
-    if (is_internode_available())
-        num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+    if (reuse_layout && (!layout_num_tokens_per_expert_cache.defined() ||
+        layout_num_tokens_per_expert_cache.size(0) != num_experts)
+    )
+        layout_num_tokens_per_expert_cache = torch::empty({num_experts}, layout_int_options);
+    auto num_tokens_per_expert = reuse_layout ? layout_num_tokens_per_expert_cache
+                                              : torch::empty({num_experts}, layout_int_options);
+    if (reuse_layout && (!layout_is_token_in_rank_cache.defined() ||
+        layout_is_token_in_rank_cache.size(0) < num_tokens ||
+        layout_is_token_in_rank_cache.size(1) != num_ranks)) {
+        layout_is_token_in_rank_cache = torch::empty(
+            {num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
+    }
+    auto is_token_in_rank = reuse_layout
+        ? layout_is_token_in_rank_cache.narrow(0, 0, num_tokens)
+        : torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
+    if (is_internode_available()) {
+        if (reuse_layout && (!layout_num_tokens_per_rdma_rank_cache.defined() ||
+            layout_num_tokens_per_rdma_rank_cache.size(0) != num_rdma_ranks)
+        )
+            layout_num_tokens_per_rdma_rank_cache = torch::empty(
+                {num_rdma_ranks}, layout_int_options);
+        num_tokens_per_rdma_rank = reuse_layout ? layout_num_tokens_per_rdma_rank_cache
+                                                : torch::empty({num_rdma_ranks}, layout_int_options);
+    }
 
     layout::get_dispatch_layout(topk_idx.data_ptr<int64_t>(),
                                 num_tokens_per_rank.data_ptr<int>(),
@@ -473,51 +514,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                            const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
                            int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
                            int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
-                           std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
-    return intranode_dispatch_impl(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
-        cached_num_recv_tokens, cached_rank_prefix_matrix, cached_channel_prefix_matrix, expert_alignment,
-        num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4, previous_event, async, allocate_on_comm_stream, false, false, 20, nullptr, nullptr);
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, torch::Tensor, torch::Tensor>
-Buffer::intranode_dispatch_expanded_bf16(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-        const torch::Tensor& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const torch::Tensor& num_tokens_per_expert,
-        int expert_alignment, const Config& config, std::optional<EventHandle>& previous_event,
-        bool async, bool allocate_on_comm_stream, bool deterministic, int epilogue_blocks) {
-    // Reject unsupported contracts before submitting a collective operation.
-    const char* dense = std::getenv("DEEPEP_DISPATCH_DENSE_STAGE");
-    EP_HOST_ASSERT(dense && dense[0] == '1' && dense[1] == '\0');
-    EP_HOST_ASSERT((num_ranks == 2 || num_ranks == 4) && config.num_sms == 20);
-    EP_HOST_ASSERT(num_rdma_ranks == 1);
-    EP_HOST_ASSERT(x.is_cuda() && x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.dim() == 2 && x.is_contiguous());
-    EP_HOST_ASSERT(topk_idx.is_cuda() && topk_idx.scalar_type() == torch::kInt64);
-    EP_HOST_ASSERT(topk_idx.dim() == 2 && topk_idx.is_contiguous());
-    EP_HOST_ASSERT(topk_weights.is_cuda() && topk_weights.scalar_type() == torch::kFloat32);
-    EP_HOST_ASSERT(topk_weights.sizes() == topk_idx.sizes() && topk_weights.is_contiguous());
-    for (auto& t : {topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert})
-        EP_HOST_ASSERT(t.is_cuda() && t.device() == x.device());
-    EP_HOST_ASSERT(topk_idx.size(1) <= 32 && expert_alignment > 0);
-    EP_HOST_ASSERT(epilogue_blocks == 20 || epilogue_blocks == 0);
-    cudaStreamCaptureStatus capture_status;
-    EP_HOST_ASSERT(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &capture_status) == cudaSuccess);
-    EP_HOST_ASSERT(capture_status == cudaStreamCaptureStatusNone);
-    torch::Tensor m, inverse;
-    auto r = intranode_dispatch_impl(x, std::nullopt, topk_idx, topk_weights,
-        num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, std::nullopt, std::nullopt,
-        expert_alignment, 0, config, false, std::nullopt, previous_event, async,
-        allocate_on_comm_stream, true, deterministic, epilogue_blocks, &m, &inverse);
-    return {std::get<0>(r), *std::get<3>(r), *std::get<4>(r), std::get<5>(r), std::get<6>(r),
-        std::get<7>(r), std::get<8>(r), std::get<9>(r), std::get<10>(r), std::get<11>(r), m, inverse};
-}
-
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
-Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
-                           const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
-                           const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
-                           int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
-                           int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
-                           std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream, bool expanded, bool deterministic, int epilogue_blocks, torch::Tensor* expanded_m, torch::Tensor* expanded_index) {
+                           std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream,
+                           const std::optional<EventHandle>& payload_event) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
 #endif
@@ -633,6 +631,8 @@ Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torc
         stream_wait(comm_stream, compute_stream);
     }
 
+    torch::Tensor send_head, recv_channel_prefix_matrix;
+
     // Create handles (only return for non-cached mode)
     int num_recv_tokens = -1;
     auto rank_prefix_matrix = torch::Tensor();
@@ -672,6 +672,19 @@ Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torc
                                    buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank,
                                    comm_stream, num_channels);
 
+        // These shapes depend only on sender/channel configuration. Allocate
+        // while notify runs, before the host polls dynamic receive counts.
+        // Keep payload allocations below count readiness as before.
+        if (env_flag("DEEPEP_FIFO_OPTIMIZED") &&
+            env_flag_default("DEEPEP_OVERLAP_METADATA_ALLOC", true)) {
+            recv_channel_prefix_matrix = torch::empty(
+                {num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
+            if (!send_head.defined()) {
+                send_head = torch::empty(
+                    {num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+            }
+        }
+
         if (num_worst_tokens > 0) {
             // No CPU sync, just allocate the worst case
             num_recv_tokens = num_worst_tokens;
@@ -686,7 +699,6 @@ Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torc
                 // Read total count
                 num_recv_tokens = static_cast<int>(*moe_recv_counter);
 
-                // Read per-expert count
                 bool ready = (num_recv_tokens >= 0);
                 for (int i = 0; i < num_local_experts and ready; ++i)
                     ready &= moe_recv_expert_counter[i] >= 0;
@@ -711,31 +723,19 @@ Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torc
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
+
     }
 
     // Allocate new tensors
-    torch::Tensor recv_x, expanded_counts, expanded_starts;
-    if (expanded) {
-        c10::cuda::CUDAStreamGuard guard(comm_stream);
-        int64_t output_rows = 0;
-        for (int count : num_recv_tokens_per_expert_list) output_rows += count;
-        recv_x = deterministic ? torch::zeros({output_rows, hidden}, x.options())
-                               : torch::empty({output_rows, hidden}, x.options());
-        auto ints = x.options().dtype(torch::kInt32);
-        *expanded_m = torch::empty({output_rows}, ints);
-        *expanded_index = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
-        expanded_starts = torch::empty({num_local_experts}, ints);
-        // ATen's pinned allocator records the asynchronous H2D lifetime.
-        auto host_counts = torch::empty({num_local_experts}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-        std::copy(num_recv_tokens_per_expert_list.begin(), num_recv_tokens_per_expert_list.end(), host_counts.data_ptr<int>());
-        expanded_counts = host_counts.to(x.device(), true);
-    } else {
-        recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
-    }
+    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     auto recv_src_idx = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(), recv_x_scales = std::optional<torch::Tensor>(), recv_sf_scale_for_nvfp4 = std::optional<torch::Tensor>();
-    auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
-    auto send_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+    if (!recv_channel_prefix_matrix.defined()) {
+        recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
+    }
+    if (!send_head.defined()) {
+        send_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+    }
 
     // Assign pointers
     int64_t* recv_topk_idx_ptr = nullptr;
@@ -754,10 +754,16 @@ Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torc
                         torch::empty({num_recv_tokens, num_scales}, x_scales->options());
         recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
     }
+
     if (use_nvfp4 and sf_scale_for_nvfp4.has_value()) {
         recv_sf_scale_for_nvfp4 = torch::empty({num_recv_tokens, num_sf_scales_for_nvfp4}, sf_scale_for_nvfp4->options());
         recv_sf_scale_for_nvfp4_ptr = static_cast<float*>(recv_sf_scale_for_nvfp4->data_ptr());
     }
+
+    // Notify only consumes routing metadata. Defer activation/weight readiness
+    // until payload launch so count exchange and host allocation can overlap it.
+    if (payload_event.has_value())
+        stream_wait(comm_stream, payload_event.value());
 
     // Dispatch
     EP_HOST_ASSERT(num_ranks * num_ranks * sizeof(int) +                                                                    // Size prefix matrix
@@ -771,47 +777,15 @@ Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torc
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales +           // FP8 scale buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_sf_scales_for_nvfp4 // NVFP4 sf_scale buffer
                    <= num_nvl_bytes);
-    const char* dense_setting = std::getenv("DEEPEP_DISPATCH_DENSE_STAGE");
-    const bool dense_stage = dense_setting && dense_setting[0] == '1' && dense_setting[1] == '\0' &&
-        (num_ranks == 2 || num_ranks == 4) && config.num_sms == 20;
-    const char* engine_setting = std::getenv("DEEPEP_DENSE_STAGE_COPY_ENGINE");
-    const bool copy_engine = dense_stage && !cached_mode && num_worst_tokens == 0 && engine_setting &&
-        engine_setting[0] == '1' && engine_setting[1] == '\0';
-    if (dense_stage) {
-        const intranode::DenseDispatchLayout dense_layout(num_recv_tokens,
-            static_cast<size_t>(hidden) * recv_x.element_size(), num_ranks, num_channels,
-            num_topk, num_scales, num_sf_scales_for_nvfp4);
-        if (copy_engine)
-            EP_HOST_ASSERT(dense_layout.bytes <= static_cast<size_t>(num_nvl_bytes));
-        intranode::dense_dispatch(recv_x.data_ptr(), recv_x_scales_ptr, recv_sf_scale_for_nvfp4_ptr,
-            recv_src_idx.data_ptr<int>(), recv_topk_idx_ptr, recv_topk_weights_ptr,
-            recv_channel_prefix_matrix.data_ptr<int>(), send_head.data_ptr<int>(), x.data_ptr(),
-            x_scales_ptr, sf_scale_for_nvfp4_ptr, topk_idx_ptr, topk_weights_ptr,
-            is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
-            num_tokens, num_recv_tokens, static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)),
-            num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4,
-            scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride,
-            sf_scale_for_nvfp4_hidden_stride, buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
-            rank, num_ranks, num_nvl_bytes, comm_stream, config.num_sms, copy_engine || expanded);
-        if (copy_engine || expanded) {
-            // Copy into independent Torch allocations; do not expose scratch aliases.
-            auto local = static_cast<uint8_t*>(buffer_ptrs[rank]);
-            auto copy = [&](void* output, size_t offset, size_t bytes) {
-                if (bytes)
-                    CUDA_CHECK(cudaMemcpyAsync(output, local + offset, bytes,
-                                               cudaMemcpyDeviceToDevice, comm_stream));
-            };
-            const size_t rows = num_recv_tokens;
-            if (!expanded) copy(recv_x.data_ptr(), dense_layout.x, rows * hidden * recv_x.element_size());
-            copy(recv_src_idx.data_ptr(), dense_layout.source, rows * sizeof(int));
-            copy(recv_topk_idx_ptr, dense_layout.topk, rows * num_topk * sizeof(int64_t));
-            copy(recv_topk_weights_ptr, dense_layout.weights, rows * num_topk * sizeof(float));
-            copy(recv_x_scales_ptr, dense_layout.scales, rows * num_scales * sizeof(float));
-            copy(recv_sf_scale_for_nvfp4_ptr, dense_layout.sf, rows * num_sf_scales_for_nvfp4 * sizeof(float));
-            copy(recv_channel_prefix_matrix.data_ptr(), dense_layout.channel,
-                 num_ranks * num_channels * sizeof(int));
-        }
-    } else {
+    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && num_ranks == 4)
+        EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
+                        (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
+    const bool parallel_local_remote = env_flag_default("DEEPEP_PARALLEL_LOCAL_REMOTE", true) &&
+        env_flag("DEEPEP_FIFO_OPTIMIZED") && env_flag_default("DEEPEP_LOCAL_BYPASS", true) &&
+        num_ranks == 4 &&
+        num_worst_tokens == 0;
+    if (parallel_local_remote)
+        stream_wait(local_stream, comm_stream);
     intranode::dispatch(recv_x.data_ptr(), recv_x_scales_ptr, recv_sf_scale_for_nvfp4_ptr, recv_src_idx.data_ptr<int>(), recv_topk_idx_ptr, recv_topk_weights_ptr, recv_channel_prefix_matrix.data_ptr<int>(),
                         send_head.data_ptr<int>(),
                         x.data_ptr(), x_scales_ptr, sf_scale_for_nvfp4_ptr, topk_idx_ptr, topk_weights_ptr,
@@ -820,26 +794,13 @@ Buffer::intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torc
                         num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4,
                         scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride,
                         buffer_ptrs_gpu, rank, num_ranks, comm_stream, config.num_sms,
-                        config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens);
-    }
+                        config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
+                        parallel_local_remote ? local_stream.stream() : nullptr);
 
-    if (expanded) {
-        // All scratch reads finish on the protected comm stream before event publication.
-        const intranode::DenseDispatchLayout layout(num_recv_tokens, hidden * x.element_size(),
-            num_ranks, num_channels, num_topk, 0, 0);
-        auto local = static_cast<const uint8_t*>(buffer_ptrs[rank]);
-        intranode::dense_dispatch_permute_bf16(local + layout.x,
-            reinterpret_cast<const int64_t*>(local + layout.topk), expanded_counts.data_ptr<int>(),
-            recv_x.data_ptr(), expanded_m->data_ptr<int>(), expanded_index->data_ptr<int64_t>(),
-            expanded_starts.data_ptr<int>(), num_recv_tokens, hidden, num_topk,
-            num_local_experts, epilogue_blocks, comm_stream);
-        for (auto& t : {*expanded_m, *expanded_index, expanded_counts, expanded_starts, recv_x}) {
-            t.record_stream(comm_stream);
-            // Expanded allocations use the comm guard regardless of the outer
-            // allocation mode. Register the caller's consumer stream in all modes.
-            t.record_stream(compute_stream);
-        }
-    }
+    // The remote queue path is ordered on comm_stream.  Make its completion
+    // event cover the independent local direct-copy path as well.
+    if (parallel_local_remote)
+        stream_wait(comm_stream, local_stream);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -893,15 +854,18 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
     auto compute_stream = at::cuda::getCurrentCUDAStream();
+    const bool early_notify = env_flag_default("DEEPEP_COMBINE_EARLY_NOTIFY", true) &&
+        env_flag("DEEPEP_FIFO_OPTIMIZED") && num_ranks == 4 && config.num_sms == 24 &&
+        async && previous_event.has_value();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
     // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
+    if (!early_notify && previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else {
+    } else if (!early_notify) {
         stream_wait(comm_stream, compute_stream);
     }
 
@@ -921,23 +885,29 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    const char* staged_env = std::getenv("DEEPEP_STAGED_COMBINE");
-    const bool staged = num_ranks == 4 && x.scalar_type() == torch::kBFloat16 &&
-        staged_env && staged_env[0] == '1' && staged_env[1] == '\0';
-    if (!staged) intranode::cached_notify_combine(buffer_ptrs_gpu, send_head.data_ptr<int>(),
+    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && num_ranks == 4)
+        EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
+                        (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
+    intranode::cached_notify_combine(buffer_ptrs_gpu, send_head.data_ptr<int>(),
                                      num_channels, num_recv_tokens, num_channels * num_ranks * 2,
                                      barrier_signal_ptrs_gpu, rank, num_ranks,
                                      comm_stream);
 
     // Assign bias pointers
-    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
     void* bias_ptrs[2] = {nullptr, nullptr};
-    for (int i = 0; i < 2; ++ i) if (bias_opts[i].has_value()) {
-        auto bias = bias_opts[i].value();
+    if (bias_0.has_value()) {
+        const auto& bias = bias_0.value();
         EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
         EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
         EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
-        bias_ptrs[i] = bias.data_ptr();
+        bias_ptrs[0] = bias.data_ptr();
+    }
+    if (bias_1.has_value()) {
+        const auto& bias = bias_1.value();
+        EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
+        EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
+        EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
+        bias_ptrs[1] = bias.data_ptr();
     }
 
     // Combine data
@@ -947,27 +917,24 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                  // Source index buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)       // Top-k weight buffer
                    <= num_nvl_bytes);
-    if (staged) {
-        constexpr int capacity = 327680;
-        const int64_t payload_bytes = static_cast<int64_t>(capacity) * hidden * x.element_size();
-        const int64_t weights_offset = 4096 + payload_bytes;
-        EP_HOST_ASSERT(num_tokens <= capacity &&
-            weights_offset + static_cast<int64_t>(capacity) * num_topk * sizeof(float) <= num_nvl_bytes);
-        EP_HOST_ASSERT(64 + num_ranks * num_channels * sizeof(int) <= 4096);
-        intranode::staged_combine_bf16(recv_x.data_ptr(), recv_topk_weights_ptr,
-            bias_ptrs[0], bias_ptrs[1], send_head.data_ptr<int>(), src_idx.data_ptr<int>(),
-            rank_prefix_matrix.data_ptr<int>(), channel_prefix_matrix.data_ptr<int>(),
-            x.data_ptr(), topk_weights_ptr, num_tokens, num_recv_tokens,
-            hidden, num_topk, num_channels, capacity, buffer_ptrs_gpu,
-            barrier_signal_ptrs_gpu, rank, comm_stream, config.num_sms);
-    } else intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
+    const bool split = num_ranks == 4 && env_flag("DEEPEP_FIFO_OPTIMIZED") &&
+        env_flag_default("DEEPEP_PARALLEL_LOCAL_REMOTE", true) &&
+        env_flag_default("DEEPEP_COMBINE_LOCAL_BYPASS", true);
+    // Local contributions and the final ordered merge run independently of
+    // the remote sender. Both kernels retain the bounded FIFO protocol.
+    if (early_notify)
+        stream_wait(comm_stream, previous_event.value());
+    if (split) stream_wait(local_stream, comm_stream);
+    intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(), recv_topk_weights_ptr,
                        x.data_ptr(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1],
                        src_idx.data_ptr<int>(), rank_prefix_matrix.data_ptr<int>(), channel_prefix_matrix.data_ptr<int>(),
                        send_head.data_ptr<int>(), num_tokens, num_recv_tokens, hidden, num_topk,
                        buffer_ptrs_gpu, rank, num_ranks,
                        comm_stream, config.num_sms,
-                       config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens);
+                       config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
+                       split ? local_stream.stream() : nullptr);
+    if (split) stream_wait(comm_stream, local_stream);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1164,9 +1131,8 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
             num_recv_tokens = static_cast<int>(*moe_recv_counter);
             num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
 
-            // Read per-expert count
             bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0);
-            for (int i = 0; i < num_local_experts and ready; ++ i)
+            for (int i = 0; i < num_local_experts and ready; ++i)
                 ready &= moe_recv_expert_counter[i] >= 0;
 
             if (ready)
@@ -1232,7 +1198,6 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
                         rank, num_ranks, cached_mode,
                         comm_stream, num_channels, low_latency_mode);
-
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1352,15 +1317,21 @@ Buffer::internode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                              num_nvl_bytes, false, low_latency_mode);
 
-    // Assign bias pointers
-    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+    // Assign bias pointers without constructing a temporary optional vector.
     void* bias_ptrs[2] = {nullptr, nullptr};
-    for (int i = 0; i < 2; ++ i) if (bias_opts[i].has_value()) {
-        auto bias = bias_opts[i].value();
+    if (bias_0.has_value()) {
+        const auto& bias = bias_0.value();
         EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
         EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
         EP_HOST_ASSERT(bias.size(0) == num_combined_tokens and bias.size(1) == hidden);
-        bias_ptrs[i] = bias.data_ptr();
+        bias_ptrs[0] = bias.data_ptr();
+    }
+    if (bias_1.has_value()) {
+        const auto& bias = bias_1.value();
+        EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
+        EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
+        EP_HOST_ASSERT(bias.size(0) == num_combined_tokens and bias.size(1) == hidden);
+        bias_ptrs[1] = bias.data_ptr();
     }
 
     // Launch data combine
@@ -1872,9 +1843,8 @@ Buffer::dispatch_pcie(const torch::Tensor& x, const std::optional<torch::Tensor>
             // Read total count
             num_recv_tokens = static_cast<int>(*moe_recv_counter);
 
-            // Read per-expert count
             bool ready = (num_recv_tokens >= 0);
-            for (int i = 0; i < num_local_experts and ready; ++ i)
+            for (int i = 0; i < num_local_experts and ready; ++i)
                 ready &= moe_recv_expert_counter[i] >= 0;
 
             if (ready)
@@ -1901,7 +1871,6 @@ Buffer::dispatch_pcie(const torch::Tensor& x, const std::optional<torch::Tensor>
         recv_rdma_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         send_rdma_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
     }
-
 
     // Assign pointers
     int64_t* recv_topk_idx_ptr = nullptr;
@@ -2126,8 +2095,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
-        .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
-        .def("intranode_dispatch_expanded_bf16", &deep_ep::Buffer::intranode_dispatch_expanded_bf16)
+        .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch,
+             pybind11::arg("x"), pybind11::arg("x_scales"), pybind11::arg("topk_idx"), pybind11::arg("topk_weights"), pybind11::arg("num_tokens_per_rank"), pybind11::arg("is_token_in_rank"), pybind11::arg("num_tokens_per_expert"), pybind11::arg("cached_num_recv_tokens"), pybind11::arg("cached_rank_prefix_matrix"), pybind11::arg("cached_channel_prefix_matrix"), pybind11::arg("expert_alignment"), pybind11::arg("num_worst_tokens"), pybind11::arg("config"), pybind11::arg("use_nvfp4"), pybind11::arg("sf_scale_for_nvfp4"), pybind11::arg("previous_event"), pybind11::arg("async"), pybind11::arg("allocate_on_comm_stream"), pybind11::arg("payload_event") = std::nullopt)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)

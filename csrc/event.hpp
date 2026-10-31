@@ -7,13 +7,14 @@ namespace deep_ep {
 
 struct EventHandle {
     std::shared_ptr<torch::Event> event;
+    at::cuda::CUDAStream recorded_stream;
 
-    EventHandle() {
+    EventHandle() : recorded_stream(at::cuda::getCurrentCUDAStream()) {
         event = std::make_shared<torch::Event>(torch::kCUDA);
-        event->record(at::cuda::getCurrentCUDAStream());
+        event->record(recorded_stream);
     }
 
-    explicit EventHandle(const at::cuda::CUDAStream& stream) {
+    explicit EventHandle(const at::cuda::CUDAStream& stream) : recorded_stream(stream) {
         event = std::make_shared<torch::Event>(torch::kCUDA);
         event->record(stream);
     }
@@ -37,7 +38,8 @@ void stream_wait(const at::cuda::CUDAStream& s_0, const at::cuda::CUDAStream& s_
 }
 
 void stream_wait(const at::cuda::CUDAStream& s, const EventHandle& event) {
-    s.unwrap().wait(*event.event);
+    if (s != event.recorded_stream)
+        s.unwrap().wait(*event.event);
 }
 
 } // namespace deep_ep

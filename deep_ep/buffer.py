@@ -83,7 +83,18 @@ class Buffer:
                 return comm.allgather(obj)
         else:
             raise ValueError("Either 'group' or 'comm' must be provided.")
-        num_nvl_bytes = max(num_nvl_bytes, 1984 * 1024 ** 2)
+        fifo_optimized = os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1"
+        if fifo_optimized:
+            if self.group_size != 4 or not allow_nvlink_for_normal_mode:
+                raise ValueError(
+                    f"FIFO transport requires EP4 with normal-mode NVLink enabled "
+                    f"(group_size={self.group_size}, low_latency={low_latency_mode}, "
+                    f"rdma_bytes={num_rdma_bytes})")
+            # AUTO mode also allocates an independent RDMA/low-latency buffer.
+            # Keep the caller's protocol size hint, plus a small fixed window budget.
+            num_nvl_bytes = max(num_nvl_bytes, 128 * 1024 ** 2)
+        else:
+            num_nvl_bytes = max(num_nvl_bytes, 1984 * 1024 ** 2)
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
@@ -247,6 +258,8 @@ class Buffer:
             config: the recommended config.
         """
 
+        if os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1" and num_ranks == 4:
+            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 96, 256, 6, 128)
         # TODO: automatically tune
         config_map = {
             2: Config(Buffer.num_sms, 24, 256, 6, 128),
@@ -275,6 +288,8 @@ class Buffer:
             config: the recommended config.
         """
 
+        if os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1" and num_ranks == 4:
+            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 48, 256, 6, 128)
         # TODO: automatically tune
         config_map = {
             2: Config(Buffer.num_sms, 10, 256, 6, 128),
@@ -294,7 +309,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
                             previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                            allocate_on_comm_stream: bool = False) -> \
+                            allocate_on_comm_stream: bool = False, reuse_workspace: bool = False) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, EventOverlap]:
         """
         Calculate the layout required for later communication.
@@ -306,6 +321,7 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            reuse_workspace: reuse internal layout storage. Returned tensors are overwritten by the next call and must not be retained.
 
         Returns:
             num_tokens_per_rank: `[num_ranks]` with `torch.int`, the number of tokens to be sent to each rank.
@@ -317,7 +333,7 @@ class Buffer:
         """
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
             self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
-                                             async_finish, allocate_on_comm_stream)
+                                             async_finish, allocate_on_comm_stream, reuse_workspace)
         return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, EventOverlap(event)
 
     # noinspection PyTypeChecker
@@ -329,11 +345,16 @@ class Buffer:
                  expert_alignment: int = 1, num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False) -> \
+                 allocate_on_comm_stream: bool = False,
+                 payload_event: Optional[EventOverlap] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
                   Optional[torch.Tensor], Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
         Dispatch tokens to different ranks, both intranode and internode settings are supported.
+        ``payload_event`` optionally separates activation/top-k-weight readiness
+        from routing readiness in ``previous_event`` (NVLink intranode only).
+        Notify/count exchange may execute before ``payload_event`` completes;
+        every payload consumer waits for it.
         Intranode kernels require all the ranks should be visible via NVLink.
         Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
             index should be visible via RDMA.
@@ -378,6 +399,10 @@ class Buffer:
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
+        if payload_event is not None:
+            assert not self.disable_nvlink_for_normal_mode and self.runtime.get_num_rdma_ranks() == 1
+        payload_dependency = (getattr(payload_event, "event", None),) if payload_event is not None else ()
+
         # Normal mode w/o NVLink
         if self.disable_nvlink_for_normal_mode:
             assert num_worst_tokens == 0, 'Internode dispatch does not support `num_worst_tokens > 0`'
@@ -408,7 +433,7 @@ class Buffer:
                 x, x_scales, None, None,
                 None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
                 expert_alignment, num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4,
-                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream, *payload_dependency)
             if x_scales is not None:
                 recv_x = (recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4) if use_nvfp4 else (recv_x, recv_x_scales)
             return recv_x, None, None, None, None, EventOverlap(event)
@@ -418,31 +443,11 @@ class Buffer:
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
                                                 expert_alignment, num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4,
-                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream, *payload_dependency)
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             if x_scales is not None:
                 recv_x = (recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4) if use_nvfp4 else (recv_x, recv_x_scales)
             return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(event)
-
-    def dispatch_expanded_bf16(self, x, *, topk_idx, topk_weights, num_tokens_per_rank,
-                              is_token_in_rank, num_tokens_per_expert, expert_alignment=1,
-                              config=None, previous_event=None, async_finish=False,
-                              allocate_on_comm_stream=False, deterministic=False, epilogue_blocks=20):
-        """Explicit uncached BF16 expert-major output; no token-major payload is returned.
-
-        The metadata/handle retain the original received-token order. All outputs
-        own their storage. Cached, worst-capacity and graph users keep dispatch().
-        epilogue_blocks controls this separate local kernel, not transport SMs.
-        """
-        assert not self.disable_nvlink_for_normal_mode
-        config = self.get_dispatch_config(self.group_size) if config is None else config
-        (expert_x, idx, weights, counts, rank_prefix, channel_prefix, recv_channel,
-         src, heads, event, m, inverse) = self.runtime.intranode_dispatch_expanded_bf16(
-            x, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
-            expert_alignment, config, getattr(previous_event, 'event', None), async_finish,
-            allocate_on_comm_stream, deterministic, epilogue_blocks)
-        handle = (rank_prefix, channel_prefix, recv_channel, src, is_token_in_rank, heads)
-        return expert_x, idx, weights, counts, handle, EventOverlap(event), m, inverse
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: Tuple,

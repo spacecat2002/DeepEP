@@ -80,6 +80,8 @@ private:
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
+    // Independent stream used by the optional local direct-copy path.
+    at::cuda::CUDAStream local_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -108,6 +110,13 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
+    // Layout outputs are reused across normal-mode calls.  The mask storage
+    // grows to the largest token batch seen by this Buffer and each call
+    // returns a narrow view, so dynamic token counts remain exact.
+    torch::Tensor layout_num_tokens_per_rank_cache;
+    torch::Tensor layout_num_tokens_per_rdma_rank_cache;
+    torch::Tensor layout_num_tokens_per_expert_cache;
+    torch::Tensor layout_is_token_in_rank_cache;
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
 public:
@@ -148,14 +157,13 @@ public:
                           const torch::Tensor& num_recv_tokens_per_expert,
                           int64_t num_output_tokens,
                           bool deterministic);
-
     void sync(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles, const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
     void destroy();
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
     get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event,
-                        bool async, bool allocate_on_comm_stream);
+                        bool async, bool allocate_on_comm_stream, bool reuse_workspace);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
     intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
@@ -163,22 +171,8 @@ public:
                        const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
                        int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
                        int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
-                       std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
-
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
-    intranode_dispatch_impl(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
-                       const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
-                       const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
-                       int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
-                       int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
-                       std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream, bool expanded, bool deterministic, int epilogue_blocks, torch::Tensor* expanded_m, torch::Tensor* expanded_index);
-
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, torch::Tensor, torch::Tensor>
-    intranode_dispatch_expanded_bf16(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-        const torch::Tensor& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const torch::Tensor& num_tokens_per_expert,
-        int expert_alignment, const Config& config, std::optional<EventHandle>& previous_event,
-        bool async, bool allocate_on_comm_stream, bool deterministic, int epilogue_blocks);
-
+                       std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream,
+                       const std::optional<EventHandle>& payload_event = std::nullopt);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     intranode_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& topk_weights,
