@@ -777,12 +777,12 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales +           // FP8 scale buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_sf_scales_for_nvfp4 // NVFP4 sf_scale buffer
                    <= num_nvl_bytes);
-    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && num_ranks == 4)
+    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && (num_ranks == 2 || num_ranks == 4 || num_ranks == 8))
         EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
                         (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
     const bool parallel_local_remote = env_flag_default("DEEPEP_PARALLEL_LOCAL_REMOTE", true) &&
         env_flag("DEEPEP_FIFO_OPTIMIZED") && env_flag_default("DEEPEP_LOCAL_BYPASS", true) &&
-        num_ranks == 4 &&
+        (num_ranks == 2 || num_ranks == 4 || num_ranks == 8) &&
         num_worst_tokens == 0;
     if (parallel_local_remote)
         stream_wait(local_stream, comm_stream);
@@ -885,7 +885,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && num_ranks == 4)
+    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && (num_ranks == 2 || num_ranks == 4 || num_ranks == 8))
         EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
                         (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
     intranode::cached_notify_combine(buffer_ptrs_gpu, send_head.data_ptr<int>(),
@@ -917,7 +917,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                  // Source index buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)       // Top-k weight buffer
                    <= num_nvl_bytes);
-    const bool split = num_ranks == 4 && env_flag("DEEPEP_FIFO_OPTIMIZED") &&
+    const bool split = (num_ranks == 2 || num_ranks == 4 || num_ranks == 8) && env_flag("DEEPEP_FIFO_OPTIMIZED") &&
         env_flag_default("DEEPEP_PARALLEL_LOCAL_REMOTE", true) &&
         env_flag_default("DEEPEP_COMBINE_LOCAL_BYPASS", true);
     // Local contributions and the final ordered merge run independently of

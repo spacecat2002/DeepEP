@@ -85,9 +85,9 @@ class Buffer:
             raise ValueError("Either 'group' or 'comm' must be provided.")
         fifo_optimized = os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1"
         if fifo_optimized:
-            if self.group_size != 4 or not allow_nvlink_for_normal_mode:
+            if self.group_size not in (2, 4, 8) or not allow_nvlink_for_normal_mode:
                 raise ValueError(
-                    f"FIFO transport requires EP4 with normal-mode NVLink enabled "
+                    f"FIFO transport requires EP2/EP4/EP8 with normal-mode NVLink enabled "
                     f"(group_size={self.group_size}, low_latency={low_latency_mode}, "
                     f"rdma_bytes={num_rdma_bytes})")
             # AUTO mode also allocates an independent RDMA/low-latency buffer.
@@ -259,7 +259,7 @@ class Buffer:
         """
 
         if os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1" and num_ranks == 4:
-            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 96, 256, 6, 128)
+            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 6, 256, 6, 128)
         # TODO: automatically tune
         config_map = {
             2: Config(Buffer.num_sms, 24, 256, 6, 128),
@@ -289,7 +289,7 @@ class Buffer:
         """
 
         if os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1" and num_ranks == 4:
-            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 48, 256, 6, 128)
+            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 9, 256, 6, 128)
         # TODO: automatically tune
         config_map = {
             2: Config(Buffer.num_sms, 10, 256, 6, 128),
