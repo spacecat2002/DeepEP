@@ -122,9 +122,10 @@ class Buffer:
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
             os.environ['NVSHMEM_QP_DEPTH'] = os.environ.get('NVSHMEM_QP_DEPTH', '1024')
 
-            # Reduce gpu memory usage
-            # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+            # Reduce GPU memory usage while leaving an explicit value intact.
+            # UltraEP communication replicas create an additional NVSHMEM team;
+            # forcing 7 here exhausts the team table before that team is split.
+            os.environ.setdefault('NVSHMEM_MAX_TEAMS', '7')
             # Disable NVLink SHArP
             os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
             # NOTES: NVSHMEM initialization requires at least 256 MiB

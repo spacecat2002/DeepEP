@@ -1,3 +1,0 @@
-deep_ep
-deep_ep_cpp
-hybrid_ep_cpp

@@ -6,3 +6,9 @@ build/
 .cache/
 .vscode/
 */cmake-build-*/
+
+# Local extension builds and package metadata
+build.failed.*/
+dist/
+*.egg-info/
+*.so
