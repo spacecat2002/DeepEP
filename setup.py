@@ -1,250 +1,137 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import ast
+import re
 import os
 import subprocess
 import setuptools
 import importlib
-import shutil
-import re
 
 from pathlib import Path
+from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+current_dir = os.path.dirname(os.path.realpath(__file__))
+persistent_env_names = ('EP_JIT_CACHE_DIR', 'EP_JIT_PRINT_COMPILER_COMMAND', 'EP_NUM_TOPK_IDX_BITS', 'EP_NCCL_ROOT_DIR')
 
-def collect_package_files(package: str, relative_dir: str):
-    base_path = Path(package) / relative_dir
-    if not base_path.exists():
-        return []
-    return [
-        str(path.relative_to(package))
-        for path in base_path.rglob('*')
-        if path.is_file()
-    ]
+# Load discover module without triggering `deep_ep.__init__`
+find_pkgs_spec = importlib.util.spec_from_file_location('find_pkgs', os.path.join(current_dir, 'deep_ep', 'utils', 'find_pkgs.py'))
+find_pkgs = importlib.util.module_from_spec(find_pkgs_spec)
+find_pkgs_spec.loader.exec_module(find_pkgs)
 
 
-# Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
-def get_nvshmem_host_lib_name(base_dir):
-    path = Path(base_dir).joinpath('lib')
-    for file in path.rglob('libnvshmem_host.so.*'):
+# Wheel specific: NVIDIA pip wheels (nvidia-nvshmem-cu12, nvidia-nccl-cu12)
+# only ship the SO name of the host library, e.g. `libnvshmem_host.so.3`,
+# without the unversioned `libnvshmem_host.so` symlink. So `-l:libnvshmem_host.so`
+# (exact-name link) cannot resolve. Resolve the real file name at build time
+# and pass it through to the linker instead.
+def _find_versioned_so(base_dir, prefix):
+    """Return the real filename of the first ``{prefix}.so*`` under ``base_dir/lib``.
+
+    Prefers an unversioned ``{prefix}.so`` symlink when present so we keep
+    behaving identically to the Tarball install. Falls back to the SONAME
+    file (``{prefix}.so.X``) shipped by pip wheels.
+    """
+    lib_dir = Path(base_dir).joinpath('lib')
+    unversioned = lib_dir / f'{prefix}.so'
+    if unversioned.exists():
+        return unversioned.name
+    for file in sorted(lib_dir.rglob(f'{prefix}.so.*')):
         return file.name
-    raise ModuleNotFoundError('libnvshmem_host.so not found')
-
-def to_nvcc_gencode(s: str) -> str:
-    flags = []
-    for part in re.split(r'[,\s;]+', s.strip()):
-        if not part:
-            continue
-        m = re.fullmatch(r'(\d+)\.(\d+)([A-Za-z]?)', part)
-        if not m:
-            raise ValueError(f"Invalid entry: {part}")
-        major, minor, suf = m.groups()
-        arch = f"{int(major)}{int(minor)}{suf.lower()}"
-        flags.append(f"-gencode=arch=compute_{arch},code=sm_{arch}")
-    return " ".join(flags)
+    raise ModuleNotFoundError(f'{prefix}.so not found under {lib_dir}')
 
 
-def get_extension_hybrid_ep_cpp():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    enable_multinode = os.getenv("HYBRID_EP_MULTINODE", "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-    # NIXL is opt-in and disabled by default; the DOCA/NCCL path is the default when multinode is enabled.
-    use_nixl = os.getenv("USE_NIXL", "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-
-    # Default to Blackwell series
-    os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '10.0')
-
-    # Basic compile arguments
-    compile_args = {
-        "nvcc": [
-            "-Xcompiler",
-            "-fPIC",
-            "--expt-relaxed-constexpr",
-            "-O3",
-            "--shared",
-        ],
-    }
-
-    sources = [
-        "csrc/hybrid_ep/hybrid_ep.cu",
-        "csrc/hybrid_ep/buffer/intranode.cu",
-        "csrc/hybrid_ep/allocator/allocator.cu",
-        "csrc/hybrid_ep/jit/compiler.cu",
-        "csrc/hybrid_ep/executor/executor.cu",
-        "csrc/hybrid_ep/extension/permute.cu",
-        "csrc/hybrid_ep/extension/allgather.cu",
-        "csrc/hybrid_ep/pybind_hybrid_ep.cu",
-    ]
-    include_dirs = [
-        os.path.join(current_dir, "csrc/hybrid_ep/"),
-        os.path.join(current_dir, "csrc/hybrid_ep/backend/"),
-    ]
-    library_dirs = []
-    libraries = ["cuda", "nvtx3interop"]
-    extra_objects = []
-    runtime_library_dirs = []
-    extra_link_args = []
-
-    # Add dependency for jit
-    compile_args["nvcc"].append(f'-DSM_ARCH="{os.environ["TORCH_CUDA_ARCH_LIST"]}"')
-    # Copy the hybrid backend code to python package for JIT compilation
-    shutil.copytree(
-        os.path.join(current_dir, "csrc/hybrid_ep/backend/"),
-        os.path.join(current_dir, "deep_ep/backend/"),
-        dirs_exist_ok=True
-    )
-    # Copy the utils.cuh
-    shutil.copy(
-        os.path.join(current_dir, "csrc/hybrid_ep/utils.cuh"),
-        os.path.join(current_dir, "deep_ep/backend/utils.cuh")
-    )
-    # Add inter-node dependency 
-    if enable_multinode:
-        compile_args["nvcc"].append("-DHYBRID_EP_BUILD_MULTINODE_ENABLE")
-        print(f'Multinode enabled: use_nixl={use_nixl} (USE_NIXL={os.getenv("USE_NIXL", "0")})')
-        if use_nixl:
-            # NIXL path: use NIXL connector instead of DOCA
-            print('  -> NIXL path: skipping NCCL/DOCA build')
-            compile_args["nvcc"].append("-DUSE_NIXL")
-            sources.extend([
-                "csrc/hybrid_ep/buffer/internode_nixl.cu",
-                "csrc/hybrid_ep/buffer/nixl_connector.cu",
-            ])
-            nixl_home = os.getenv("NIXL_HOME", "/usr/local/nixl")
-            ucx_home = os.getenv("UCX_HOME", "/usr")
-            nixl_include = os.path.join(nixl_home, "include")
-            nixl_gpu_include = os.path.join(nixl_home, "include/gpu/ucx")
-            import platform
-            machine = platform.machine()
-            if machine == "aarch64":
-                nixl_lib_suffix = "lib/aarch64-linux-gnu"
-            else:
-                nixl_lib_suffix = "lib/x86_64-linux-gnu"
-            nixl_lib = os.path.join(nixl_home, nixl_lib_suffix)
-            include_dirs.extend([nixl_include, nixl_gpu_include, os.path.join(ucx_home, "include")])
-            library_dirs.append(nixl_lib)
-            runtime_library_dirs.append(nixl_lib)
-            libraries.extend(["nixl", "nixl_build", "nixl_common"])
-            extra_link_args.extend([f"-Wl,-rpath,{nixl_lib}"])
-            extra_link_args.append("-l:libnvidia-ml.so.1")
-            libraries.extend(["mlx5", "ibverbs"])
-            doca_home = os.getenv("DOCA_HOME", "")
-            if doca_home:
-                include_dirs.append(os.path.join(doca_home, "include"))
-            rdma_core_dir = os.getenv("RDMA_CORE_HOME", "")
-            if rdma_core_dir:
-                include_dirs.append(os.path.join(rdma_core_dir, "include"))
-                library_dirs.append(os.path.join(rdma_core_dir, "lib"))
-        else:
-            # DOCA path: use RDMA coordinator (requires NCCL submodule + DOCA)
-            print('  -> DOCA path: building NCCL/DOCA')
-            sources.extend(["csrc/hybrid_ep/buffer/internode_doca.cu"])
-            rdma_core_dir = os.getenv("RDMA_CORE_HOME", "")
-            nccl_dir = os.path.join(current_dir, "third-party/nccl")
-            compile_args["nvcc"].append(f"-DRDMA_CORE_HOME=\"{rdma_core_dir}\"")
-            extra_link_args.append(f"-l:libnvidia-ml.so.1")
-
-            subprocess.run(["git", "submodule", "update", "--init", "--recursive"], cwd=current_dir)
-            subprocess.run(
-                ["make", "-j", "src.build", f"NVCC_GENCODE={to_nvcc_gencode(os.environ['TORCH_CUDA_ARCH_LIST'])}"],
-                cwd=nccl_dir,
-                check=True,
-            )
-            include_dirs.append(os.path.join(nccl_dir, "src/transport/net_ib/gdaki/doca-gpunetio/include"))
-            include_dirs.append(os.path.join(rdma_core_dir, "include"))
-            library_dirs.append(os.path.join(rdma_core_dir, "lib"))
-            runtime_library_dirs.append(os.path.join(rdma_core_dir, "lib"))
-            libraries.append("mlx5")
-            libraries.append("ibverbs")
-            shutil.copytree(
-                os.path.join(nccl_dir, "src/transport/net_ib/gdaki/doca-gpunetio/include"),
-                os.path.join(current_dir, "deep_ep/backend/nccl/include"),
-                dirs_exist_ok=True
-            )
-            shutil.copytree(
-                os.path.join(nccl_dir, "build/obj/transport/net_ib/gdaki/doca-gpunetio"),
-                os.path.join(current_dir, "deep_ep/backend/nccl/obj"),
-                dirs_exist_ok=True
-            )
-            DOCA_OBJ_PATH = os.path.join(current_dir, "deep_ep/backend/nccl/obj")
-            extra_objects = [
-                os.path.join(DOCA_OBJ_PATH, "doca_gpunetio.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_gpunetio_high_level.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_cuda_wrapper.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_device_attr.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_ibv_wrapper.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_mlx5dv_wrapper.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_qp.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_cq.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_srq.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_uar.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_verbs_umem.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_gpunetio_gdrcopy.o"),
-                os.path.join(DOCA_OBJ_PATH, "doca_gpunetio_log.o"),
-            ]
+def get_nvshmem_host_lib_name(base_dir):
+    return _find_versioned_so(base_dir, 'libnvshmem_host')
 
 
-    print(f'Build summary:')
-    print(f' > Sources: {sources}')
-    print(f' > Includes: {include_dirs}')
-    print(f' > Libraries: {libraries}')
-    print(f' > Library dirs: {library_dirs}')
-    print(f' > Extra link args: {extra_link_args}')
-    print(f' > Compilation flags: {compile_args}')
-    print(f' > Extra objects: {extra_objects}')
-    print(f' > Runtime library dirs: {runtime_library_dirs}')
-    print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
-    print()
+def get_nccl_lib_name(base_dir):
+    return _find_versioned_so(base_dir, 'libnccl')
 
-    extension_hybrid_ep_cpp = CUDAExtension(
-        "hybrid_ep_cpp",
-        sources=sources,
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        libraries=libraries,
-        extra_compile_args=compile_args,
-        extra_objects=extra_objects,
-        runtime_library_dirs=runtime_library_dirs,
-        extra_link_args=extra_link_args,
-    )
 
-    return extension_hybrid_ep_cpp
+def get_package_version():
+    with open(Path(current_dir) / 'deep_ep' / '__init__.py', 'r') as f:
+        version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
+    public_version = ast.literal_eval(version_match.group(1))
 
-def get_extension_deep_ep_cpp():
-    disable_nvshmem = False
-    nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
-    nvshmem_host_lib = 'libnvshmem_host.so'
-    if nvshmem_dir is None:
-        try:
-            nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
-            nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
-            import nvidia.nvshmem as nvshmem
-        except (ModuleNotFoundError, AttributeError, IndexError):
-            print('Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n')
-            disable_nvshmem = True
-    else:
-        disable_nvshmem = False
+    # noinspection PyBroadException
+    try:
+        status_cmd = ['git', 'status', '--porcelain']
+        status_output = subprocess.check_output(status_cmd).decode('ascii').strip()
+        if status_output:
+            print(f'Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}')
+            assert False, 'Git working directory is not clean'
 
-    if not disable_nvshmem:
-        assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
+        cmd = ['git', 'rev-parse', '--short', 'HEAD']
+        revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
+    except:
+        revision = '+local'
+    return f'{public_version}{revision}'
 
-    cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable',
-                 '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
-    nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
-    include_dirs = ['csrc/']
+
+class CustomBuildPy(build_py):
+    def run(self):
+        # Make clusters' cache setting default into `envs.py`
+        self.generate_default_envs()
+
+        # Finally, run the regular build
+        build_py.run(self)
+
+    def generate_default_envs(self):
+        code = '# Pre-installed environment variables\n'
+        code += 'persistent_envs = dict()\n'
+        # noinspection PyShadowingNames
+        for name in persistent_env_names:
+            code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
+
+        # Create temporary build directory
+        build_include_dir = os.path.join(self.build_lib, 'deep_ep')
+        os.makedirs(build_include_dir, exist_ok=True)
+        with open(os.path.join(self.build_lib, 'deep_ep', 'envs.py'), 'w') as f:
+            f.write(code)
+
+
+if __name__ == '__main__':
+    # TODO: make NVSHMEM and legacy optional
+    nvshmem_root_dir = find_pkgs.find_nvshmem_root()
+    nccl_root_dir = find_pkgs.find_nccl_root()
+
+    # `128,2417` is used to suppress warnings of `fmt`
+    cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
+    nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
+    test_variant = os.getenv('DEEPEP_TEST_VARIANT')
+    if test_variant:
+        assert test_variant == 'REMOTE_DIRECT'
+        cxx_flags.append(f'-DDEEPEP_TEST_{test_variant}')
+        nvcc_flags.append(f'-DDEEPEP_TEST_{test_variant}')
+    sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
+    include_dirs = [f'{current_dir}/deep_ep/include',
+                    f'{current_dir}/third-party/fmt/include',
+                    '/usr/local/cuda/include/cccl']
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
 
-    # NVSHMEM flags
-    if disable_nvshmem:
-        cxx_flags.append('-DDISABLE_NVSHMEM')
-        nvcc_flags.append('-DDISABLE_NVSHMEM')
-    else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu', 'csrc/kernels/pcie.cu'])
-        include_dirs.extend([f'{nvshmem_dir}/include'])
-        library_dirs.extend([f'{nvshmem_dir}/lib'])
-        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
-        extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
+    # NVSHMEM flags. Use the real on-disk file name (which may be SONAME-only
+    # like ``libnvshmem_host.so.3`` when NVSHMEM came from a pip wheel) so
+    # that ``-l:NAME`` can resolve. The static device library always ships
+    # under its canonical name, so it stays hard-coded.
+    sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
+    include_dirs.extend([f'{nvshmem_root_dir}/include'])
+    library_dirs.extend([f'{nvshmem_root_dir}/lib'])
+    nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
+    nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_root_dir)
+    extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
 
+    # NCCL flags. Same story as NVSHMEM above — pip wheels ship
+    # ``libnccl.so.2`` only, so resolve the real name dynamically.
+    sources.extend(['csrc/kernels/backend/nccl.cu'])
+    include_dirs.extend([f'{nccl_root_dir}/include'])
+    nccl_lib = get_nccl_lib_name(nccl_root_dir)
+    extra_link_args.extend([f'-l:{nccl_lib}', f'-Wl,-rpath,{nccl_root_dir}/lib'])
+
+    # CUDA driver sources
+    sources.extend(['csrc/kernels/backend/cuda_driver.cu'])
+
+    # TODO: remove these
     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
         # Prefer A100
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '8.0')
@@ -254,17 +141,13 @@ def get_extension_deep_ep_cpp():
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
 
         # Disable internode and low-latency kernels
-        assert disable_nvshmem
+        assert False, 'Not implemented'
     else:
         # Prefer H800 series
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
 
         # CUDA 12 flags
         nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
-        
-        # Ensure device linking and CUDA device runtime when RDC is enabled
-        if '-rdc=true' in nvcc_flags and '-dlink' not in nvcc_dlink:
-            nvcc_dlink.append('-dlink')
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
     if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':
@@ -276,6 +159,17 @@ def get_extension_deep_ep_cpp():
         cxx_flags.append('-DDISABLE_AGGRESSIVE_PTX_INSTRS')
         nvcc_flags.append('-DDISABLE_AGGRESSIVE_PTX_INSTRS')
 
+    # Legacy environment name
+    if 'TOPK_IDX_BITS' in os.environ:
+        assert 'EP_NUM_TOPK_IDX_BITS' not in os.environ
+        os.environ['EP_NUM_TOPK_IDX_BITS'] = os.environ['TOPK_IDX_BITS']
+
+    # Bits of `topk_idx.dtype`, choices are 32 and 64
+    if 'EP_NUM_TOPK_IDX_BITS' in os.environ:
+        num_topk_idx_bits = int(os.environ['EP_NUM_TOPK_IDX_BITS'])
+        cxx_flags.append(f'-DEP_NUM_TOPK_IDX_BITS={num_topk_idx_bits}')
+        nvcc_flags.append(f'-DEP_NUM_TOPK_IDX_BITS={num_topk_idx_bits}')
+
     # Put them together
     extra_compile_args = {
         'cxx': cxx_flags,
@@ -285,53 +179,45 @@ def get_extension_deep_ep_cpp():
         extra_compile_args['nvcc_dlink'] = nvcc_dlink
 
     # Summary
-    print(f'Build summary:')
+    print('Build summary:')
     print(f' > Sources: {sources}')
     print(f' > Includes: {include_dirs}')
     print(f' > Libraries: {library_dirs}')
     print(f' > Compilation flags: {extra_compile_args}')
     print(f' > Link flags: {extra_link_args}')
     print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
-    print(f' > NVSHMEM path: {nvshmem_dir}')
+    print(f' > NVSHMEM path: {nvshmem_root_dir}')
+    print(f' > NCCL path: {nccl_root_dir}')
+    # Print persistent env variables
+    persistent_envs = []
+    for name in persistent_env_names:
+        if name in os.environ:
+            persistent_envs.append((name, os.environ[name]))
+    if len(persistent_envs) > 0:
+        print(f' > Persistent envs:')
+        for k, v in persistent_envs:
+            print(f'   > {k}: {v}')
     print()
-
-    extension_deep_ep_cpp = CUDAExtension(
-        name='deep_ep_cpp',
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        sources=sources,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args
-    )
-
-    return extension_deep_ep_cpp
-
-if __name__ == '__main__':
-    # noinspection PyBroadException
-    try:
-        cmd = ['git', 'rev-parse', '--short', 'HEAD']
-        revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-    except Exception as _:
-        revision = ''
 
     setuptools.setup(
         name='deep_ep',
-        version='1.2.1' + revision,
-        packages=setuptools.find_packages(
-            include=['deep_ep']
-        ),
-        install_requires=[
-            'pynvml',
-        ],
+        version=get_package_version(),
+        packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
+        package_data={
+            'deep_ep': [
+                'include/deep_ep/**/*',
+            ]
+        },
         ext_modules=[
-            get_extension_deep_ep_cpp(),
-            get_extension_hybrid_ep_cpp()
+            CUDAExtension(name='deep_ep._C',
+                          include_dirs=include_dirs,
+                          library_dirs=library_dirs,
+                          sources=sources,
+                          extra_compile_args=extra_compile_args,
+                          extra_link_args=extra_link_args)
         ],
         cmdclass={
-            'build_ext': BuildExtension
-        },
-        package_data={
-            'deep_ep': collect_package_files('deep_ep', 'backend'),
-        },
-        include_package_data=True
+            'build_ext': BuildExtension,
+            'build_py': CustomBuildPy
+        }
     )
