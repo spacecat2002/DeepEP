@@ -780,8 +780,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     if (env_flag("DEEPEP_FIFO_OPTIMIZED") && (num_ranks == 2 || num_ranks == 4 || num_ranks == 8))
         EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
                         (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
-    const bool parallel_local_remote = env_flag_default("DEEPEP_PARALLEL_LOCAL_REMOTE", true) &&
-        env_flag("DEEPEP_FIFO_OPTIMIZED") && env_flag_default("DEEPEP_LOCAL_BYPASS", true) &&
+    // FIFO is the sole transport switch; legacy split-path settings are ignored.
+    const bool parallel_local_remote = env_flag("DEEPEP_FIFO_OPTIMIZED") &&
+        env_flag_default("DEEPEP_LOCAL_BYPASS", true) &&
         (num_ranks == 2 || num_ranks == 4 || num_ranks == 8) &&
         num_worst_tokens == 0;
     if (parallel_local_remote)
@@ -918,7 +919,6 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)       // Top-k weight buffer
                    <= num_nvl_bytes);
     const bool split = (num_ranks == 2 || num_ranks == 4 || num_ranks == 8) && env_flag("DEEPEP_FIFO_OPTIMIZED") &&
-        env_flag_default("DEEPEP_PARALLEL_LOCAL_REMOTE", true) &&
         env_flag_default("DEEPEP_COMBINE_LOCAL_BYPASS", true);
     // Local contributions and the final ordered merge run independently of
     // the remote sender. Both kernels retain the bounded FIFO protocol.
