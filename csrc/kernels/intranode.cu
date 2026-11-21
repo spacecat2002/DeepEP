@@ -1,5 +1,4 @@
 #include "configs.cuh"
-#include "fifo_config.cuh"
 #include "buffer.cuh"
 #include "exception.cuh"
 #include "launch.cuh"

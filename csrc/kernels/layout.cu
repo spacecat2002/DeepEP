@@ -1,4 +1,3 @@
-#include "fifo_config.cuh"
 #include <cstdlib>
 #include "configs.cuh"
 #include "exception.cuh"

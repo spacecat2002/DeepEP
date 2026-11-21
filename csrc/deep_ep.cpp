@@ -11,7 +11,6 @@
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
-#include "kernels/fifo_config.cuh"
 
 namespace shared_memory {
 void cu_mem_set_access_all(void* ptr, size_t size) {
