@@ -1455,10 +1455,6 @@ void combine(cudaDataType_t type,
     constexpr int kNumTMABytesPerWarp = 4096;
     const bool no_bias_fast = bias_0 == nullptr && bias_1 == nullptr;
     const bool split = optimized_fifo_enabled(num_ranks) && local_stream != nullptr;
-    // Retain the validated shape specialization and its queue-capacity guard.
-    const bool wide_recv_safe = num_recv_buffer_tokens - num_max_send_tokens >= 1024 / 32 - 2;
-    const int recv_threads = wide_recv_safe && no_bias_fast && hidden == 3072 && num_sms == 20
-        ? 1024 : kNumThreads;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
@@ -1468,19 +1464,16 @@ void combine(cudaDataType_t type,
         auto receiver = no_bias_fast ? \
             combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, CombinePath::Receiver, true> : \
             combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, CombinePath::Receiver>; \
-        if (recv_threads == 1024) receiver = no_bias_fast ? \
-            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, CombinePath::Receiver, true> : \
-            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, CombinePath::Receiver>; \
         auto sender = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, CombinePath::Sender>; \
         /* Resolve both kernels before the sender can block on FIFO progress. */ \
         SET_SHARED_MEMORY_FOR_TMA(receiver); \
         SET_SHARED_MEMORY_FOR_TMA(sender); \
-        launch_payload(sender, stream, kNumThreads, true); \
-        launch_payload(receiver, local_stream, recv_threads, true); \
+        launch_payload(sender, stream, true); \
+        launch_payload(receiver, local_stream, true); \
     } else { \
         auto kernel = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>; \
         SET_SHARED_MEMORY_FOR_TMA(kernel); \
-        launch_payload(kernel, stream, kNumThreads, false); \
+        launch_payload(kernel, stream, false); \
     } \
 } break
 #define COMBINE_DTYPE_LAUNCH_CASE(dtype) SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE); break
@@ -1498,9 +1491,8 @@ void combine(cudaDataType_t type,
         cfg.gridDim.x = num_sms / 2;
     }
 #endif
-    auto launch_payload = [&](auto kernel, cudaStream_t launch_stream, int threads, bool fifo) {
+    auto launch_payload = [&](auto kernel, cudaStream_t launch_stream, bool fifo) {
         cfg.stream = launch_stream;
-        cfg.blockDim.x = threads;
         if (fifo) cfg.dynamicSmemBytes = 0;
         using Dtype = typename KernelScalar<decltype(kernel)>::type;
         LAUNCH_KERNEL(&cfg, kernel,
