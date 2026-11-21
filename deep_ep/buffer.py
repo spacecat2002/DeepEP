@@ -261,19 +261,19 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 24, 256, 6, 128),
-            4: Config(Buffer.num_sms, 6, 256, 6, 128),
-            8: Config(Buffer.num_sms, 6, 256, 6, 128),
-            16: Config(Buffer.num_sms, 36, 288, 20, 128),
-            24: Config(Buffer.num_sms, 8, 288, 32, 128),
-            32: Config(Buffer.num_sms, 32, 288, 32, 128),
-            64: Config(Buffer.num_sms, 20, 288, 28, 128),
-            128: Config(Buffer.num_sms, 20, 560, 32, 128),
-            144: Config(Buffer.num_sms, 32, 720, 12, 128),
-            160: Config(Buffer.num_sms, 28, 720, 12, 128),
+            2: (24, 256, 6, 128),
+            4: (6, 256, 6, 128),
+            8: (6, 256, 6, 128),
+            16: (36, 288, 20, 128),
+            24: (8, 288, 32, 128),
+            32: (32, 288, 32, 128),
+            64: (20, 288, 28, 128),
+            128: (20, 560, 32, 128),
+            144: (32, 720, 12, 128),
+            160: (28, 720, 12, 128),
         }
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
-        return config_map[num_ranks]
+        return Config(Buffer.num_sms, *config_map[num_ranks])
 
     @staticmethod
     def get_combine_config(num_ranks: int) -> Config:
@@ -289,19 +289,19 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
-            16: Config(Buffer.num_sms, 4, 288, 12, 128),
-            24: Config(Buffer.num_sms, 1, 288, 8, 128),
-            32: Config(Buffer.num_sms, 1, 288, 8, 128),
-            64: Config(Buffer.num_sms, 1, 288, 20, 128),
-            128: Config(Buffer.num_sms, 1, 560, 12, 128),
-            144: Config(Buffer.num_sms, 2, 720, 8, 128),
-            160: Config(Buffer.num_sms, 2, 720, 8, 128),
+            2: (10, 256, 6, 128),
+            4: (9, 256, 6, 128),
+            8: (4, 256, 6, 128),
+            16: (4, 288, 12, 128),
+            24: (1, 288, 8, 128),
+            32: (1, 288, 8, 128),
+            64: (1, 288, 20, 128),
+            128: (1, 560, 12, 128),
+            144: (2, 720, 8, 128),
+            160: (2, 720, 8, 128),
         }
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
-        return config_map[num_ranks]
+        return Config(Buffer.num_sms, *config_map[num_ranks])
 
     # noinspection PyTypeChecker
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
