@@ -427,38 +427,28 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
     }
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
-    const bool reuse_layout = reuse_workspace;
     auto layout_int_options = dtype(torch::kInt32).device(torch::kCUDA);
-    if (reuse_layout && (!layout_num_tokens_per_rank_cache.defined() ||
-        layout_num_tokens_per_rank_cache.size(0) != num_ranks))
-        layout_num_tokens_per_rank_cache = torch::empty({num_ranks}, layout_int_options);
-    auto num_tokens_per_rank = reuse_layout ? layout_num_tokens_per_rank_cache
-                                            : torch::empty({num_ranks}, layout_int_options);
+    auto counts = [&](torch::Tensor& cache, int size) {
+        if (!reuse_workspace)
+            return torch::empty({size}, layout_int_options);
+        if (!cache.defined() || cache.size(0) != size)
+            cache = torch::empty({size}, layout_int_options);
+        return cache;
+    };
+    auto num_tokens_per_rank = counts(layout_num_tokens_per_rank_cache, num_ranks);
+    auto num_tokens_per_expert = counts(layout_num_tokens_per_expert_cache, num_experts);
     auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
-    if (reuse_layout && (!layout_num_tokens_per_expert_cache.defined() ||
-        layout_num_tokens_per_expert_cache.size(0) != num_experts)
-    )
-        layout_num_tokens_per_expert_cache = torch::empty({num_experts}, layout_int_options);
-    auto num_tokens_per_expert = reuse_layout ? layout_num_tokens_per_expert_cache
-                                              : torch::empty({num_experts}, layout_int_options);
-    if (reuse_layout && (!layout_is_token_in_rank_cache.defined() ||
+    if (reuse_workspace && (!layout_is_token_in_rank_cache.defined() ||
         layout_is_token_in_rank_cache.size(0) < num_tokens ||
         layout_is_token_in_rank_cache.size(1) != num_ranks)) {
         layout_is_token_in_rank_cache = torch::empty(
             {num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
     }
-    auto is_token_in_rank = reuse_layout
+    auto is_token_in_rank = reuse_workspace
         ? layout_is_token_in_rank_cache.narrow(0, 0, num_tokens)
         : torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
-    if (is_internode_available()) {
-        if (reuse_layout && (!layout_num_tokens_per_rdma_rank_cache.defined() ||
-            layout_num_tokens_per_rdma_rank_cache.size(0) != num_rdma_ranks)
-        )
-            layout_num_tokens_per_rdma_rank_cache = torch::empty(
-                {num_rdma_ranks}, layout_int_options);
-        num_tokens_per_rdma_rank = reuse_layout ? layout_num_tokens_per_rdma_rank_cache
-                                                : torch::empty({num_rdma_ranks}, layout_int_options);
-    }
+    if (is_internode_available())
+        num_tokens_per_rdma_rank = counts(layout_num_tokens_per_rdma_rank_cache, num_rdma_ranks);
 
     layout::get_dispatch_layout(topk_idx.data_ptr<int64_t>(),
                                 num_tokens_per_rank.data_ptr<int>(),
@@ -663,10 +653,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         if (fifo_optimized) {
             recv_channel_prefix_matrix = torch::empty(
                 {num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
-            if (!send_head.defined()) {
-                send_head = torch::empty(
-                    {num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
-            }
+            send_head = torch::empty(
+                {num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         }
 
         if (num_worst_tokens > 0) {
