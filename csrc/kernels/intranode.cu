@@ -1,4 +1,5 @@
 #include "configs.cuh"
+#include "fifo_config.cuh"
 #include "buffer.cuh"
 #include "exception.cuh"
 #include "launch.cuh"
@@ -9,11 +10,14 @@ namespace deep_ep {
 
 namespace intranode {
 
-inline bool env_flag_default(const char* name, bool default_value) {
-    const char* value = std::getenv(name);
-    if (value == nullptr) return default_value;
-    return value[0] == '1' && value[1] == '\0';
-}
+// Separate kernel roles are required by the local/remote stream dependencies.
+// They are execution roles, not independently tunable implementations.
+enum class DispatchPath { Reference, UnifiedFifo, Local, Remote };
+enum class CombinePath { Reference, Sender, Receiver };
+
+template <typename Kernel> struct KernelScalar;
+template <typename Dtype, typename... Args>
+struct KernelScalar<void (*)(Dtype*, Args...)> { using type = Dtype; };
 
 template <int kNumRanks>
 __device__ __forceinline__ void load_rank_bits(const bool* row, uint64_t (&bits)[2]) {
@@ -281,7 +285,8 @@ __host__ __device__ __forceinline__ WarpPartition partition_remote_warp(
     return {peer + (peer >= self),begin,small + (group < extra)};
 }
 
-template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseTMA = true, bool kLocalBypass = false, int kScanMode = 0, int kRouteMode = 0>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp,
+          bool kUseTMA = true, DispatchPath kPath = DispatchPath::Reference, bool kCompactTma = false>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
          int* send_head, const int4* x, const float* x_scales, const float* sf_scale_for_nvfp4, const int64_t* topk_idx, const float* topk_weights,
@@ -289,7 +294,10 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
          int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales, int num_sf_scales_for_nvfp4,
          int scale_token_stride, int scale_hidden_stride, int sf_scale_for_nvfp4_token_stride, int sf_scale_for_nvfp4_hidden_stride,
          void** buffer_ptrs, int rank,
-         int num_max_send_tokens, int num_recv_buffer_tokens, bool balanced_sender, bool redistribute_warps) {
+         int num_max_send_tokens, int num_recv_buffer_tokens) {
+    constexpr bool kOptimized = kPath != DispatchPath::Reference;
+    constexpr bool kLocalOnly = kPath == DispatchPath::Local;
+    constexpr bool kRemoteOnly = kPath == DispatchPath::Remote;
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -297,7 +305,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 
     // Clear padding before sender/receiver branches can return early.
     // Valid payload rows are disjoint from this tail, including split streams.
-    if (num_worst_tokens > 0 && kRouteMode != 1) {
+    if (num_worst_tokens > 0 && !kLocalOnly) {
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         const auto num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank];
         const auto clean_start = num_recv_tokens * num_topk + sm_id * kNumThreads;
@@ -315,8 +323,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     int rank_thread_begin = responsible_rank * num_threads_per_rank;
     // Uniform whole-warp partition across actual remote peers. Quotient
     // and remainder handle rank counts which do not divide the warp budget.
-    if constexpr (kRouteMode == 2) {
-        if (!is_sender && redistribute_warps) {
+    if constexpr (kRemoteOnly) {
+        if (!is_sender) {
             const auto group = partition_remote_warp(thread_id / 32,
                 kNumThreads / 32, kNumRanks, rank);
             responsible_rank = group.rank;
@@ -327,24 +335,10 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     __shared__ int sender_total_rows;
     __shared__ int sender_warp_counts[kNumRanks];
     __shared__ int sender_warp_offsets[kNumRanks];
-    if constexpr (kRouteMode == 1) {
-        if (is_sender && !balanced_sender && redistribute_warps) {
-            responsible_rank = rank;
-            rank_thread_begin = 0;
-            num_threads_per_rank = kNumThreads;
-        }
-    }
-    if constexpr (kRouteMode == 2) {
-        if (is_sender && !balanced_sender && redistribute_warps) {
-            const auto group = partition_remote_warp(thread_id / 32,
-                kNumThreads / 32, kNumRanks, rank);
-            responsible_rank = group.rank;
-            rank_thread_begin = group.begin * 32;
-            num_threads_per_rank = group.count * 32;
-        }
-    }
-    if constexpr (kScanMode >= 4) {
-        if (is_sender && balanced_sender) {
+
+
+    if constexpr (kOptimized) {
+        if (is_sender) {
             // Compute the per-destination warp allocation once per sender
             // block. Repeating this prefix arithmetic in all 768 threads was
             // pure fixed overhead; every thread only needs the final mapping.
@@ -352,8 +346,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 int total_rows = 0;
                 for (int destination = 0; destination < kNumRanks; ++destination) {
                     const int* prefix = channel_prefix_matrix + destination * num_channels;
-                    if ((kRouteMode != 1 || destination == rank) &&
-                        (kRouteMode != 2 || destination != rank))
+                    if ((!kLocalOnly || destination == rank) &&
+                        (!kRemoteOnly || destination != rank))
                         total_rows += prefix[sm_id / 2] - (sm_id / 2 ? prefix[sm_id / 2 - 1] : 0);
                 }
                 sender_total_rows = total_rows;
@@ -363,8 +357,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 }
                 if (total_rows > 0) {
                 // Split kernels allocate workers only to destinations they execute.
-                constexpr int active_ranks = kRouteMode == 1 ? 1 :
-                    kRouteMode == 2 ? kNumRanks - 1 : kNumRanks;
+                constexpr int active_ranks = kLocalOnly ? 1 :
+                    kRemoteOnly ? kNumRanks - 1 : kNumRanks;
                 constexpr int extra_warps = kNumThreads / 32 - active_ranks;
                 int64_t remainders[kNumRanks];
                 int remaining_warps = kNumThreads / 32;
@@ -372,11 +366,11 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 for (int destination = 0; destination < kNumRanks; ++destination) {
                     const int* prefix = channel_prefix_matrix + destination * num_channels;
                     int rows = prefix[sm_id / 2] - (sm_id / 2 ? prefix[sm_id / 2 - 1] : 0);
-                    if ((kRouteMode == 1 && destination != rank) ||
-                        (kRouteMode == 2 && destination == rank)) rows = 0;
+                    if ((kLocalOnly && destination != rank) ||
+                        (kRemoteOnly && destination == rank)) rows = 0;
                     const int64_t scaled_rows = static_cast<int64_t>(rows) * extra_warps;
-                    const bool active = (kRouteMode != 1 || destination == rank) &&
-                        (kRouteMode != 2 || destination != rank);
+                    const bool active = (!kLocalOnly || destination == rank) &&
+                        (!kRemoteOnly || destination != rank);
                     sender_warp_counts[destination] = active + static_cast<int>(scaled_rows / total_rows);
                     remainders[destination] = scaled_rows % total_rows;
                     remaining_warps -= sender_warp_counts[destination];
@@ -427,7 +421,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
     auto ring_slot = [&](int ordinal) {
-        if constexpr (kScanMode >= 6) {
+        if constexpr (kOptimized) {
             return ordinal & (num_recv_buffer_tokens - 1);
         }
         return ordinal % num_recv_buffer_tokens;
@@ -470,7 +464,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         const int local_begin = rank > 0
             ? static_cast<int*>(buffer_ptrs[rank])[(rank - 1) * kNumRanks + rank]
             : 0;
-        const bool local_destination = kLocalBypass && responsible_rank == rank;
+        const bool local_destination = kOptimized && responsible_rank == rank;
         const int local_rank_offset = local_destination ? local_begin : 0;
         const int local_channel_offset = local_destination && responsible_channel > 0
             ? __ldg(channel_prefix_matrix + rank * num_channels + responsible_channel - 1)
@@ -484,7 +478,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     // Keep the existing per-warp shared-memory slice. A whole row avoids
     // a second TMA load/wait/store when it fits; larger rows retain two parts.
-    const int tma_parts = kScanMode == 9 ? 1 : kScanMode >= 3 &&
+    const int tma_parts = kCompactTma ? 1 : kOptimized &&
         static_cast<int64_t>(hidden_int4) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp ? 1 : 2;
     const int half_hidden_int4 = hidden_int4 / tma_parts;
     const int half_hidden_bytes = half_hidden_int4 * static_cast<int>(sizeof(int4));
@@ -514,8 +508,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         const auto send_warp_id_in_rank = (send_thread_id - rank_thread_begin) / 32;
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
-        constexpr bool local_only = kRouteMode == 1;
-        constexpr bool remote_only = kRouteMode == 2;
+        constexpr bool local_only = kLocalOnly;
+        constexpr bool remote_only = kRemoteOnly;
         const bool process_destination = (!local_only || local_destination) &&
             (!remote_only || !local_destination);
         if (!process_destination) return;
@@ -538,8 +532,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         // Local rows bypass the queue and are written directly to the final
         // receive layout. Publish their channel base directly so the paired
         // receiver block can return without polling an empty queue.
-        if constexpr (kLocalBypass) {
-            if (local_destination && kRouteMode == 1 && send_warp_id_in_rank == 0 && elect_one_sync()) {
+        if constexpr (kOptimized) {
+            if (local_destination && kLocalOnly && send_warp_id_in_rank == 0 && elect_one_sync()) {
                 const int channel_begin = responsible_channel > 0
                     ? __ldg(channel_prefix_matrix + rank * num_channels + responsible_channel - 1)
                     : 0;
@@ -561,8 +555,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 : channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
             auto shifted_x = x + token_idx * hidden_int4;
 #ifndef DISABLE_SM90_FEATURES
-            if constexpr (kLocalBypass) {
-                if constexpr (kScanMode == 9 && kUseTMA) {
+            if constexpr (kOptimized) {
+                if constexpr (kCompactTma && kUseTMA) {
                 // This specialization is selected only when the full row fits
                 // the existing warp slice; larger rows use the generic copy.
                 tma_store_wait<0>();
@@ -653,7 +647,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 
             int chunk_token_idx = 0;
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
-                if constexpr (kScanMode >= 2) {
+                if constexpr (kOptimized) {
                     // All warps agree on chunk/tile boundaries, but each warp
                     // enumerates only its own payload rows within a tile.
                     if (token_idx >= tile_end) {
@@ -709,7 +703,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             // Complete asynchronous payload stores before publishing the
             // channel tail. A read-only wait would allow premature publication.
 #ifndef DISABLE_SM90_FEATURES
-            if constexpr (kScanMode == 9 && kUseTMA) {
+            if constexpr (kCompactTma && kUseTMA) {
                 asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
                 __syncwarp();
             }
@@ -723,7 +717,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             }
         }
     } else {
-        if constexpr (kRouteMode == 1)
+        if constexpr (kLocalOnly)
             return;
         // Workers for receiving and copying into buffer
         constexpr int num_recv_warps = kNumThreads / 32;
@@ -737,8 +731,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         // Calculate offset first
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
-        if constexpr (kRouteMode == 2) {
-            if constexpr (kLocalBypass) {
+        if constexpr (kRemoteOnly) {
+            if constexpr (kOptimized) {
                 if (responsible_rank == rank)
                     return;
             }
@@ -759,7 +753,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 
         // Self-destination rows were written directly by the sender warps into
         // the final receive tensors, so this receiver group has no queue to drain.
-        if constexpr (kLocalBypass) {
+        if constexpr (kOptimized) {
             if (responsible_rank == rank)
                 return;
         }
@@ -867,6 +861,15 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 
 }
 
+template <int Ranks, int Threads, int TmaBytes, DispatchPath Path>
+auto select_dispatch(bool use_tma, bool compact_tma) {
+    if constexpr (Path != DispatchPath::Reference) {
+        if (compact_tma) return dispatch<Ranks, Threads, TmaBytes, true, Path, true>;
+    }
+    return use_tma ? dispatch<Ranks, Threads, TmaBytes, true, Path>
+                   : dispatch<Ranks, Threads, TmaBytes, false, Path>;
+}
+
 void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
               int* send_head, const void* x, const float* x_scales, const float* sf_scale_for_nvfp4, const int64_t* topk_idx, const float* topk_weights,
               const bool* is_token_in_rank, const int* channel_prefix_matrix,
@@ -879,19 +882,9 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
     constexpr int kNumTMABytesPerWarp = 8192;
     const bool use_tma = hidden_int4 % 2 == 0 &&
         static_cast<int64_t>(hidden_int4 / 2) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp;
-    const char* fifo_env = std::getenv("DEEPEP_FIFO_OPTIMIZED");
-    const bool fifo_optimized = fifo_env && fifo_env[0] == '1' && fifo_env[1] == '\0' &&
-        (num_ranks == 2 || num_ranks == 4 || num_ranks == 8);
-    // Keep the production interface to one optimized-path switch. Compile-time
-    // specializations below are implementation details selected by shape.
-    const bool local_bypass = fifo_optimized &&
-        env_flag_default("DEEPEP_LOCAL_BYPASS", true);
+    const bool fifo_optimized = optimized_fifo_enabled(num_ranks);
     const bool compact_tma_shape = use_tma &&
         static_cast<int64_t>(hidden_int4) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp;
-    const int scan_mode = fifo_optimized ? (compact_tma_shape ? 9 : 6) : 0;
-    const bool redistribute_warps = env_flag_default("DEEPEP_DISPATCH_REDISTRIBUTE_WARPS", true);
-    const bool balanced_sender = (!fifo_optimized ||
-        env_flag_default("DEEPEP_DISPATCH_BALANCED_SEND", true)) && redistribute_warps;
 
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
@@ -902,46 +895,15 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
     EP_HOST_ASSERT(static_cast<int64_t>(num_sf_scales_for_nvfp4) * sf_scale_for_nvfp4_hidden_stride < std::numeric_limits<int>::max());
 
 #define DISPATCH_LAUNCH_CASE(ranks) { \
-    if (local_stream != nullptr && local_bypass) { \
-    auto local_kernel = scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 9, 1> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 9, 1>) : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 6, 1> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 6, 1>) : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 0, 1> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 0, 1>); \
-    cfg.stream = local_stream; \
-    SET_SHARED_MEMORY_FOR_TMA(local_kernel); \
-    LAUNCH_KERNEL(&cfg, local_kernel, \
-        reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
-        send_head, reinterpret_cast<const int4*>(x), x_scales, sf_scale_for_nvfp4, topk_idx, topk_weights, \
-        is_token_in_rank, channel_prefix_matrix, \
-        num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4, \
-        scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride, \
-        buffer_ptrs, rank, num_max_send_tokens, num_recv_buffer_tokens, balanced_sender, redistribute_warps); \
-    auto remote_kernel = scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 9, 2> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 9, 2>) : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 6, 2> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 6, 2>) : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 0, 2> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 0, 2>); \
-    cfg.stream = stream; \
-    SET_SHARED_MEMORY_FOR_TMA(remote_kernel); \
-    LAUNCH_KERNEL(&cfg, remote_kernel, \
-        reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
-        send_head, reinterpret_cast<const int4*>(x), x_scales, sf_scale_for_nvfp4, topk_idx, topk_weights, \
-        is_token_in_rank, channel_prefix_matrix, \
-        num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4, \
-        scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride, \
-        buffer_ptrs, rank, num_max_send_tokens, num_recv_buffer_tokens, balanced_sender, redistribute_warps); \
+    if (local_stream != nullptr && fifo_optimized) { \
+        launch_payload(select_dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, DispatchPath::Local>(use_tma, compact_tma_shape), local_stream); \
+        launch_payload(select_dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, DispatchPath::Remote>(use_tma, compact_tma_shape), stream); \
+    } else if (fifo_optimized) { \
+        launch_payload(select_dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, DispatchPath::UnifiedFifo>(use_tma, compact_tma_shape), stream); \
     } else { \
-    auto kernel = local_bypass \
-        ? (scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 9> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 9>) \
-           : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true, 6> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true, 6>) \
-           : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, true> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, true>)) \
-        : (scan_mode == 9 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, false, 9> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, false, 9>) \
-           : scan_mode == 6 ? (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, false, 6> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, false, 6>) \
-           : (use_tma ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, false> : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, false>)); \
-    SET_SHARED_MEMORY_FOR_TMA(kernel); \
-    LAUNCH_KERNEL(&cfg, kernel, \
-        reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
-        send_head, reinterpret_cast<const int4*>(x), x_scales, sf_scale_for_nvfp4, topk_idx, topk_weights, \
-        is_token_in_rank, channel_prefix_matrix, \
-        num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4, \
-        scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride, \
-        buffer_ptrs, rank, \
-        num_max_send_tokens, num_recv_buffer_tokens, balanced_sender, redistribute_warps); \
+        launch_payload(select_dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, DispatchPath::Reference>(use_tma, false), stream); \
     } \
-    } break
+} break
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(num_sms % 2 == 0);
@@ -949,6 +911,19 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
 #ifndef DISABLE_SM90_FEATURES
     if (local_stream != nullptr) attr[0].val.cooperative = 0;
 #endif
+    auto launch_payload = [&](auto kernel, cudaStream_t launch_stream) {
+        cfg.stream = launch_stream;
+        SET_SHARED_MEMORY_FOR_TMA(kernel);
+        LAUNCH_KERNEL(&cfg, kernel,
+            reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4,
+            recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,
+            reinterpret_cast<const int4*>(x), x_scales, sf_scale_for_nvfp4, topk_idx, topk_weights,
+            is_token_in_rank, channel_prefix_matrix, num_tokens, num_worst_tokens, hidden_int4,
+            num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4,
+            scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride,
+            sf_scale_for_nvfp4_hidden_stride, buffer_ptrs, rank,
+            num_max_send_tokens, num_recv_buffer_tokens);
+    };
     SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
@@ -1028,9 +1003,7 @@ void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
         buffer_ptrs, send_head, num_channels, num_recv_tokens, num_memset_int, barrier_signal_ptrs, rank); \
     } break
 
-    const char* fifo_setting = std::getenv("DEEPEP_FIFO_OPTIMIZED");
-    const bool parallel_heads = fifo_setting && fifo_setting[0] == '1' && fifo_setting[1] == '\0' &&
-        num_ranks == 4 && num_channels == 10;
+    const bool parallel_heads = optimized_fifo_enabled(num_ranks) && num_ranks == 4 && num_channels == 10;
     const int num_threads = std::max(128, 32 * num_ranks);
     EP_HOST_ASSERT(num_ranks <= num_threads);
     EP_HOST_ASSERT(num_threads <= 1024);
@@ -1041,9 +1014,7 @@ void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
 }
 
 template<typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp,
-         bool kGlobalStore = false,
-         bool kBalancedSender = false, bool kLocalBypass = false,
-         bool kSingleSourceFast = false, bool kNoBiasFast = false, int kRouteMode = 0>
+         CombinePath kPath = CombinePath::Reference, bool kNoBiasFast = false>
 __global__ void __launch_bounds__(kNumThreads, 1)
 combine(dtype_t* recv_x, float* recv_topk_weights,
         const dtype_t* x, const float* topk_weights,
@@ -1051,19 +1022,22 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
         int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
         void** buffer_ptrs, int rank,
-        int num_max_send_tokens, int num_recv_buffer_tokens, bool redistribute_warps) {
-    const auto num_sms = static_cast<int>(gridDim.x) * (kRouteMode ? 2 : 1);
+        int num_max_send_tokens, int num_recv_buffer_tokens) {
+    constexpr bool kOptimized = kPath != CombinePath::Reference;
+    constexpr bool kSenderOnly = kPath == CombinePath::Sender;
+    constexpr bool kReceiverOnly = kPath == CombinePath::Receiver;
+    const auto num_sms = static_cast<int>(gridDim.x) * (kOptimized ? 2 : 1);
     const auto thread_id = static_cast<int>(threadIdx.x);
-    const auto sm_id = static_cast<int>(blockIdx.x) * (kRouteMode ? 2 : 1) + (kRouteMode == 2), lane_id = get_lane_id();
+    const auto sm_id = static_cast<int>(blockIdx.x) * (kOptimized ? 2 : 1) + (kReceiverOnly), lane_id = get_lane_id();
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
-    if constexpr (kRouteMode == 1) { if (!is_sender) return; }
-    if constexpr (kRouteMode == 2) { if (is_sender) return; }
+    if constexpr (kSenderOnly) { if (!is_sender) return; }
+    if constexpr (kReceiverOnly) { if (is_sender) return; }
     const int responsible_channel = sm_id / 2;
     const bool recv_buffer_is_power_of_two =
         (num_recv_buffer_tokens & (num_recv_buffer_tokens - 1)) == 0;
     auto ring_slot = [&](int ordinal) {
-        if constexpr (kGlobalStore || kLocalBypass)
+        if constexpr (kOptimized)
             return ordinal & (num_recv_buffer_tokens - 1);
         return recv_buffer_is_power_of_two
             ? ordinal & (num_recv_buffer_tokens - 1)
@@ -1095,8 +1069,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         const auto send_warp_id = send_thread_id / 32;
         int send_rank_id = (responsible_channel + send_warp_id) % kNumRanks;
         int send_warp_id_in_rank = send_warp_id / kNumRanks;
-        if constexpr (kRouteMode == 1) {
-          if (redistribute_warps) {
+        if constexpr (kSenderOnly) {
+          {
             const auto group = partition_remote_warp(send_warp_id,
                 num_send_warps,kNumRanks,rank,responsible_channel);
             num_send_warps_per_rank = group.count;
@@ -1107,57 +1081,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         }
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
-        if constexpr (kBalancedSender) {
-            int rows[kNumRanks];
-            int total_rows = 0;
-            #pragma unroll
-            for (int peer = 0; peer < kNumRanks; ++peer) {
-                const int begin = peer ? rank_prefix_matrix[(peer - 1) * kNumRanks + rank] : 0;
-                const int count = rank_prefix_matrix[peer * kNumRanks + rank] - begin;
-                const int channel_begin = channel_prefix_matrix[peer * num_channels + responsible_channel];
-                const int channel_end = responsible_channel + 1 == num_channels ? count :
-                    channel_prefix_matrix[peer * num_channels + responsible_channel + 1];
-                rows[peer] = channel_end - channel_begin;
-                if constexpr (kRouteMode == 1) if (peer == rank) rows[peer] = 0;
-                total_rows += rows[peer];
-            }
-            if (total_rows > 0) {
-                constexpr int active_ranks = kRouteMode == 1 ? kNumRanks - 1 : kNumRanks;
-                constexpr int extra = num_send_warps - active_ranks;
-                int warps[kNumRanks];
-                int64_t remainders[kNumRanks];
-                int remaining = num_send_warps;
-                #pragma unroll
-                for (int peer = 0; peer < kNumRanks; ++peer) {
-                    const int64_t scaled = static_cast<int64_t>(rows[peer]) * extra;
-                    const bool active = kRouteMode != 1 || peer != rank;
-                    warps[peer] = static_cast<int>(active) + static_cast<int>(scaled / total_rows);
-                    remainders[peer] = scaled % total_rows;
-                    remaining -= warps[peer];
-                }
-                #pragma unroll
-                for (int peer = 0; peer < kNumRanks; ++peer) {
-                    int priority = 0;
-                    #pragma unroll
-                    for (int other = 0; other < kNumRanks; ++other)
-                        priority += remainders[other] > remainders[peer] ||
-                            (remainders[other] == remainders[peer] && other < peer);
-                    warps[peer] += priority < remaining;
-                }
-                int first = 0;
-                #pragma unroll
-                for (int peer = 0; peer < kNumRanks; ++peer) {
-                    if (send_warp_id >= first && send_warp_id < first + warps[peer]) {
-                        send_rank_id = peer;
-                        send_warp_id_in_rank = send_warp_id - first;
-                        num_send_warps_per_rank = warps[peer];
-                        num_threads_per_rank = warps[peer] * 32;
-                    }
-                    first += warps[peer];
-                }
-            }
-        }
-        const bool local_destination = kLocalBypass && send_rank_id == rank;
+
+        const bool local_destination = kOptimized && send_rank_id == rank;
         // Local rows are read directly by the receiver during reduction. The
         // local sender group has no queue, payload, or tail update to perform.
         if (local_destination)
@@ -1267,7 +1192,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
             // Queue head updater
             int last_head = 0;
-            while (lane_id < kNumRanks && !(kLocalBypass && lane_id == rank)) {
+            while (lane_id < kNumRanks && !(kOptimized && lane_id == rank)) {
                 // Check retired
                 bool retired = true;
                 #pragma unroll
@@ -1316,7 +1241,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_recv_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
             int local_row_base = 0;
-            if constexpr (kLocalBypass) {
+            if constexpr (kOptimized) {
                 const int local_rank_offset = rank > 0
                     ? __ldg(rank_prefix_matrix + (rank - 1) * kNumRanks + rank)
                     : 0;
@@ -1334,7 +1259,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
                 auto start_time = clock64();
                 while (__any_sync(0xffffffff, expected_head >= 0 and
-                                  !(kLocalBypass && lane_id == rank) &&
+                                  !(kOptimized && lane_id == rank) &&
                                   channel_tail_idx[lane_id] <= expected_head)) {
                     // Timeout check
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -1351,7 +1276,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 for (int i = 0; i < kNumRanks; ++ i) {
                     auto expected_head_i = __shfl_sync(0xffffffff, expected_head, i);
                     if (expected_head_i >= 0) {
-                        if constexpr (kLocalBypass) {
+                        if constexpr (kOptimized) {
                             if (i == rank) {
                                 local_row_indices[num_topk_ranks] = local_row_base + expected_head_i;
                                 slot_indices[num_topk_ranks] = 0;
@@ -1368,7 +1293,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 }
 
                 // A single contribution needs no general multi-rank reduction.
-                if constexpr (kSingleSourceFast) {
+                if constexpr (kOptimized) {
                     if (num_topk_ranks == 1) {
                         const int source_rank = topk_ranks[0];
                         const bool is_local = source_rank == rank;
@@ -1412,7 +1337,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
                 // Wait shared memory release
 #ifndef DISABLE_SM90_FEATURES
-                if constexpr (!kGlobalStore) {
+                if constexpr (!kOptimized) {
                     tma_store_wait<0>();
                     __syncwarp();
                 }
@@ -1427,7 +1352,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     int4 recv_value_int4[kNumRanks];
                     #pragma unroll
                     for (int j = 0; j < num_topk_ranks; ++ j) {
-                        if constexpr (kLocalBypass) {
+                        if constexpr (kOptimized) {
                             recv_value_int4[j] = topk_ranks[j] == rank
                                 ? __ldg(x_int4 + static_cast<int64_t>(local_row_indices[j]) * hidden_int4 + i)
                                 : ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
@@ -1471,7 +1396,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                         out_dtypes[j] = static_cast<dtype_t>(values[j]);
 
 #ifndef DISABLE_SM90_FEATURES
-                    if constexpr (kGlobalStore) {
+                    if constexpr (kOptimized) {
                         recv_int4[token_idx * hidden_int4 + i] = out_int4;
                     } else if (i < hidden_int4_aligned) {
                         // Wait TMA arrival
@@ -1504,7 +1429,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     float value = 0;
                     #pragma unroll
                     for (int i = 0; i < num_topk_ranks; ++ i) {
-                        if constexpr (kLocalBypass) {
+                        if constexpr (kOptimized) {
                             value += topk_ranks[i] == rank
                                 ? __ldg(topk_weights + static_cast<int64_t>(local_row_indices[i]) * num_topk + lane_id)
                                 : ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
@@ -1540,85 +1465,36 @@ void combine(cudaDataType_t type,
              cudaStream_t local_stream) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 4096;
-    const char* fifo_setting = std::getenv("DEEPEP_FIFO_OPTIMIZED");
-    const bool fifo_optimized = fifo_setting && fifo_setting[0] == '1' && fifo_setting[1] == '\0' &&
-        (num_ranks == 2 || num_ranks == 4 || num_ranks == 8);
-    const bool global_store = (num_ranks == 2 || num_ranks == 4 || num_ranks == 8) &&
-        fifo_optimized;
-    const bool redistribute_warps = env_flag_default("DEEPEP_COMBINE_REDISTRIBUTE_WARPS", true);
-    const bool balanced_sender = fifo_optimized && redistribute_warps &&
-        env_flag_default("DEEPEP_COMBINE_BALANCED_SEND", false);
-    const bool local_bypass = fifo_optimized &&
-        env_flag_default("DEEPEP_COMBINE_LOCAL_BYPASS", true);
-    const bool no_bias_fast = local_bypass && bias_0 == nullptr && bias_1 == nullptr;
-    // Increase receiver latency hiding within the same ten-CTA grid for the
-    // measured QMSum shape. Other shapes/configurations keep their old default.
-    // The queue must also cover the lag between 31 interleaved consumers;
-    // otherwise a sender waiting for a whole chunk can block their progress.
+    const bool no_bias_fast = bias_0 == nullptr && bias_1 == nullptr;
+    const bool split = optimized_fifo_enabled(num_ranks) && local_stream != nullptr;
+    // Retain the validated shape specialization and its queue-capacity guard.
     const bool wide_recv_safe = num_recv_buffer_tokens - num_max_send_tokens >= 1024 / 32 - 2;
-    const int recv_threads = wide_recv_safe && env_flag_default("DEEPEP_COMBINE_RECV_1024",
-        no_bias_fast && hidden == 3072 && num_sms == 20) ? 1024 : kNumThreads;
+    const int recv_threads = wide_recv_safe && no_bias_fast && hidden == 3072 && num_sms == 20
+        ? 1024 : kNumThreads;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks) { \
-    auto kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true> : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false>; \
-    if constexpr (ranks == 4) { \
-        if (balanced_sender) { \
-            kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, true> : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false, true>; \
-        } \
-        if (local_bypass && !balanced_sender) { \
-            if (no_bias_fast) kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true, true> : \
-                combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false, false, true, true, true>; \
-            else kernel = global_store ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true> : \
-                combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false, false, true, true>; \
-        } \
-    } \
-    if (local_stream != nullptr && local_bypass) { \
-        auto local_kernel = no_bias_fast ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true, true, 2> : \
-            combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, true, false, 2>; \
-        if (recv_threads == 1024) local_kernel = no_bias_fast ? \
-            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, true, false, true, true, true, 2> : \
-            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, true, false, true, true, false, 2>; \
-        /* Load both kernels before the sender can block on FIFO progress. */ \
-        SET_SHARED_MEMORY_FOR_TMA(local_kernel); \
-        kernel = balanced_sender ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, true, true, false, false, 1> : \
-            combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true, false, true, false, false, 1>; \
-    SET_SHARED_MEMORY_FOR_TMA(kernel); \
-    cfg.dynamicSmemBytes = 0; \
-    LAUNCH_KERNEL(&cfg, kernel, \
-        reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
-        reinterpret_cast<const dtype*>(x), topk_weights,   \
-        reinterpret_cast<const dtype*>(bias_0), reinterpret_cast<const dtype*>(bias_1), \
-        src_idx, rank_prefix_matrix, channel_prefix_matrix, \
-        send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
-        buffer_ptrs, rank, \
-        num_max_send_tokens, num_recv_buffer_tokens, redistribute_warps); \
-        cfg.stream = local_stream; \
-        kernel = local_kernel; \
-        cfg.blockDim.x = recv_threads; \
-    LAUNCH_KERNEL(&cfg, kernel, \
-        reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
-        reinterpret_cast<const dtype*>(x), topk_weights,   \
-        reinterpret_cast<const dtype*>(bias_0), reinterpret_cast<const dtype*>(bias_1), \
-        src_idx, rank_prefix_matrix, channel_prefix_matrix, \
-        send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
-        buffer_ptrs, rank, \
-        num_max_send_tokens, num_recv_buffer_tokens, redistribute_warps); \
-        cfg.stream = stream; \
+    if (split) { \
+        auto receiver = no_bias_fast ? \
+            combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, CombinePath::Receiver, true> : \
+            combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, CombinePath::Receiver>; \
+        if (recv_threads == 1024) receiver = no_bias_fast ? \
+            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, CombinePath::Receiver, true> : \
+            combine<dtype, ranks, 1024, kNumTMABytesPerWarp, CombinePath::Receiver>; \
+        auto sender = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, CombinePath::Sender>; \
+        /* Resolve both kernels before the sender can block on FIFO progress. */ \
+        SET_SHARED_MEMORY_FOR_TMA(receiver); \
+        SET_SHARED_MEMORY_FOR_TMA(sender); \
+        launch_payload(sender, stream, kNumThreads, true); \
+        launch_payload(receiver, local_stream, recv_threads, true); \
     } else { \
-    SET_SHARED_MEMORY_FOR_TMA(kernel); \
-    LAUNCH_KERNEL(&cfg, kernel, \
-        reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
-        reinterpret_cast<const dtype*>(x), topk_weights,   \
-        reinterpret_cast<const dtype*>(bias_0), reinterpret_cast<const dtype*>(bias_1), \
-        src_idx, rank_prefix_matrix, channel_prefix_matrix, \
-        send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
-        buffer_ptrs, rank, \
-        num_max_send_tokens, num_recv_buffer_tokens, redistribute_warps); \
-    } } \
-    break
+        auto kernel = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>; \
+        SET_SHARED_MEMORY_FOR_TMA(kernel); \
+        launch_payload(kernel, stream, kNumThreads, false); \
+    } \
+} break
 #define COMBINE_DTYPE_LAUNCH_CASE(dtype) SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE); break
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving
@@ -1634,6 +1510,19 @@ void combine(cudaDataType_t type,
         cfg.gridDim.x = num_sms / 2;
     }
 #endif
+    auto launch_payload = [&](auto kernel, cudaStream_t launch_stream, int threads, bool fifo) {
+        cfg.stream = launch_stream;
+        cfg.blockDim.x = threads;
+        if (fifo) cfg.dynamicSmemBytes = 0;
+        using Dtype = typename KernelScalar<decltype(kernel)>::type;
+        LAUNCH_KERNEL(&cfg, kernel,
+            reinterpret_cast<Dtype*>(recv_x), recv_topk_weights,
+            reinterpret_cast<const Dtype*>(x), topk_weights,
+            reinterpret_cast<const Dtype*>(bias_0), reinterpret_cast<const Dtype*>(bias_1),
+            src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
+            num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs, rank,
+            num_max_send_tokens, num_recv_buffer_tokens);
+    };
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE

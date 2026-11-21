@@ -346,16 +346,11 @@ class Buffer:
                  expert_alignment: int = 1, num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False,
-                 payload_event: Optional[EventOverlap] = None) -> \
+                 allocate_on_comm_stream: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
                   Optional[torch.Tensor], Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
         Dispatch tokens to different ranks, both intranode and internode settings are supported.
-        ``payload_event`` optionally separates activation/top-k-weight readiness
-        from routing readiness in ``previous_event`` (NVLink intranode only).
-        Notify/count exchange may execute before ``payload_event`` completes;
-        every payload consumer waits for it.
         Intranode kernels require all the ranks should be visible via NVLink.
         Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
             index should be visible via RDMA.
@@ -400,10 +395,6 @@ class Buffer:
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
-        if payload_event is not None:
-            assert not self.disable_nvlink_for_normal_mode and self.runtime.get_num_rdma_ranks() == 1
-        payload_dependency = (getattr(payload_event, "event", None),) if payload_event is not None else ()
-
         # Normal mode w/o NVLink
         if self.disable_nvlink_for_normal_mode:
             assert num_worst_tokens == 0, 'Internode dispatch does not support `num_worst_tokens > 0`'
@@ -434,7 +425,7 @@ class Buffer:
                 x, x_scales, None, None,
                 None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
                 expert_alignment, num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4,
-                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream, *payload_dependency)
+                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             if x_scales is not None:
                 recv_x = (recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4) if use_nvfp4 else (recv_x, recv_x_scales)
             return recv_x, None, None, None, None, EventOverlap(event)
@@ -444,7 +435,7 @@ class Buffer:
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
                                                 expert_alignment, num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4,
-                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream, *payload_dependency)
+                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             if x_scales is not None:
                 recv_x = (recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4) if use_nvfp4 else (recv_x, recv_x_scales)

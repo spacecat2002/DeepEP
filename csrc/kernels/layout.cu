@@ -1,3 +1,4 @@
+#include "fifo_config.cuh"
 #include <cstdlib>
 #include "configs.cuh"
 #include "exception.cuh"
@@ -160,12 +161,7 @@ void get_dispatch_layout(const int64_t* topk_idx,
                          int* num_tokens_per_expert, bool* is_token_in_rank,
                          int num_tokens, int num_topk, int num_ranks, int num_experts,
                          cudaStream_t stream) {
-    const char* fast_env = std::getenv("DEEPEP_SINGLE_PASS_LAYOUT");
-    const char* fifo_env = std::getenv("DEEPEP_FIFO_OPTIMIZED");
-    const bool fifo_default = !fast_env && fifo_env && fifo_env[0] == '1' && fifo_env[1] == '\0';
-    const bool single_pass = fifo_default ||
-        (fast_env && fast_env[0] == '1' && fast_env[1] == '\0');
-    if (single_pass &&
+    if (optimized_fifo_enabled(num_ranks) &&
         num_ranks == 4 && num_topk == 8 && num_experts <= 512 && !num_tokens_per_rdma_rank) {
         SETUP_LAUNCH_CONFIG(20, 256, stream);
         CUDA_CHECK(cudaMemsetAsync(num_tokens_per_rank, 0, 4 * sizeof(int), stream));

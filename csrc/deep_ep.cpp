@@ -13,6 +13,7 @@
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
+#include "kernels/fifo_config.cuh"
 
 namespace {
 bool env_flag(const char* name) {
@@ -20,10 +21,7 @@ bool env_flag(const char* name) {
     return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
-bool env_flag_default(const char* name, bool default_value) {
-    const char* value = std::getenv(name);
-    return value == nullptr ? default_value : value[0] == '1' && value[1] == '\0';
-}
+
 
 }  // namespace
 
@@ -442,7 +440,7 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
     }
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
-    const bool reuse_layout = reuse_workspace && !env_flag("DEEPEP_DISABLE_LAYOUT_CACHE");
+    const bool reuse_layout = reuse_workspace;
     auto layout_int_options = dtype(torch::kInt32).device(torch::kCUDA);
     if (reuse_layout && (!layout_num_tokens_per_rank_cache.defined() ||
         layout_num_tokens_per_rank_cache.size(0) != num_ranks))
@@ -514,8 +512,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                            const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
                            int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
                            int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
-                           std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream,
-                           const std::optional<EventHandle>& payload_event) {
+                           std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
 #endif
@@ -675,8 +672,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         // These shapes depend only on sender/channel configuration. Allocate
         // while notify runs, before the host polls dynamic receive counts.
         // Keep payload allocations below count readiness as before.
-        if (env_flag("DEEPEP_FIFO_OPTIMIZED") &&
-            env_flag_default("DEEPEP_OVERLAP_METADATA_ALLOC", true)) {
+        if (deep_ep::optimized_fifo_enabled(num_ranks)) {
             recv_channel_prefix_matrix = torch::empty(
                 {num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
             if (!send_head.defined()) {
@@ -762,8 +758,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Notify only consumes routing metadata. Defer activation/weight readiness
     // until payload launch so count exchange and host allocation can overlap it.
-    if (payload_event.has_value())
-        stream_wait(comm_stream, payload_event.value());
 
     // Dispatch
     EP_HOST_ASSERT(num_ranks * num_ranks * sizeof(int) +                                                                    // Size prefix matrix
@@ -777,13 +771,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales +           // FP8 scale buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_sf_scales_for_nvfp4 // NVFP4 sf_scale buffer
                    <= num_nvl_bytes);
-    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && (num_ranks == 2 || num_ranks == 4 || num_ranks == 8))
+    if (deep_ep::optimized_fifo_enabled(num_ranks))
         EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
                         (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
     // FIFO is the sole transport switch; legacy split-path settings are ignored.
-    const bool parallel_local_remote = env_flag("DEEPEP_FIFO_OPTIMIZED") &&
-        env_flag_default("DEEPEP_LOCAL_BYPASS", true) &&
-        (num_ranks == 2 || num_ranks == 4 || num_ranks == 8) &&
+    const bool parallel_local_remote = deep_ep::optimized_fifo_enabled(num_ranks) &&
         num_worst_tokens == 0;
     if (parallel_local_remote)
         stream_wait(local_stream, comm_stream);
@@ -855,8 +847,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    const bool early_notify = env_flag_default("DEEPEP_COMBINE_EARLY_NOTIFY", true) &&
-        env_flag("DEEPEP_FIFO_OPTIMIZED") && num_ranks == 4 && config.num_sms == 24 &&
+    const bool early_notify = deep_ep::optimized_fifo_enabled(num_ranks) && num_ranks == 4 && config.num_sms == 24 &&
         async && previous_event.has_value();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
@@ -886,7 +877,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    if (env_flag("DEEPEP_FIFO_OPTIMIZED") && (num_ranks == 2 || num_ranks == 4 || num_ranks == 8))
+    if (deep_ep::optimized_fifo_enabled(num_ranks))
         EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
                         (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
     intranode::cached_notify_combine(buffer_ptrs_gpu, send_head.data_ptr<int>(),
@@ -918,8 +909,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                  // Source index buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)       // Top-k weight buffer
                    <= num_nvl_bytes);
-    const bool split = (num_ranks == 2 || num_ranks == 4 || num_ranks == 8) && env_flag("DEEPEP_FIFO_OPTIMIZED") &&
-        env_flag_default("DEEPEP_COMBINE_LOCAL_BYPASS", true);
+    const bool split = deep_ep::optimized_fifo_enabled(num_ranks);
     // Local contributions and the final ordered merge run independently of
     // the remote sender. Both kernels retain the bounded FIFO protocol.
     if (early_notify)
@@ -2096,7 +2086,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch,
-             pybind11::arg("x"), pybind11::arg("x_scales"), pybind11::arg("topk_idx"), pybind11::arg("topk_weights"), pybind11::arg("num_tokens_per_rank"), pybind11::arg("is_token_in_rank"), pybind11::arg("num_tokens_per_expert"), pybind11::arg("cached_num_recv_tokens"), pybind11::arg("cached_rank_prefix_matrix"), pybind11::arg("cached_channel_prefix_matrix"), pybind11::arg("expert_alignment"), pybind11::arg("num_worst_tokens"), pybind11::arg("config"), pybind11::arg("use_nvfp4"), pybind11::arg("sf_scale_for_nvfp4"), pybind11::arg("previous_event"), pybind11::arg("async"), pybind11::arg("allocate_on_comm_stream"), pybind11::arg("payload_event") = std::nullopt)
+             pybind11::arg("x"), pybind11::arg("x_scales"), pybind11::arg("topk_idx"), pybind11::arg("topk_weights"), pybind11::arg("num_tokens_per_rank"), pybind11::arg("is_token_in_rank"), pybind11::arg("num_tokens_per_expert"), pybind11::arg("cached_num_recv_tokens"), pybind11::arg("cached_rank_prefix_matrix"), pybind11::arg("cached_channel_prefix_matrix"), pybind11::arg("expert_alignment"), pybind11::arg("num_worst_tokens"), pybind11::arg("config"), pybind11::arg("use_nvfp4"), pybind11::arg("sf_scale_for_nvfp4"), pybind11::arg("previous_event"), pybind11::arg("async"), pybind11::arg("allocate_on_comm_stream"))
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
