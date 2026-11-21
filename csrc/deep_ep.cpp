@@ -1,10 +1,8 @@
 // Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDADataType.h>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cuda_runtime.h>
 #include <memory>
 #include <pybind11/functional.h>
@@ -14,16 +12,6 @@
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
 #include "kernels/fifo_config.cuh"
-
-namespace {
-bool env_flag(const char* name) {
-    const char* value = std::getenv(name);
-    return value != nullptr && value[0] == '1' && value[1] == '\0';
-}
-
-
-
-}  // namespace
 
 namespace shared_memory {
 void cu_mem_set_access_all(void* ptr, size_t size) {
