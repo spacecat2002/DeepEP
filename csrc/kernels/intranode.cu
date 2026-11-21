@@ -508,16 +508,12 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         const auto send_warp_id_in_rank = (send_thread_id - rank_thread_begin) / 32;
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
-        constexpr bool local_only = kLocalOnly;
-        constexpr bool remote_only = kRemoteOnly;
-        const bool process_destination = (!local_only || local_destination) &&
-            (!remote_only || !local_destination);
-        if (!process_destination) return;
-        const bool write_head = process_destination;
-        const bool write_metadata = process_destination;
+        if ((kLocalOnly && !local_destination) ||
+            (kRemoteOnly && local_destination))
+            return;
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (write_metadata && send_warp_id_in_rank == 0 and elect_one_sync()) {
+        if (send_warp_id_in_rank == 0 and elect_one_sync()) {
             int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
             st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
@@ -629,7 +625,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            if (process_destination && !local_destination && elect_one_sync()) {
+            if (!local_destination && elect_one_sync()) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                     int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
@@ -658,9 +654,8 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                         selected_mask = __ballot_sync(0xffffffff, selected);
                         if (send_warp_id_in_rank == 0 && tile_base + lane_id < tile_end) {
                             int prefix = __popc(selected_mask & ((1u << lane_id) - 1));
-                            if (write_head)
-                                send_head[(tile_base + lane_id) * kNumRanks + responsible_rank] =
-                                    selected ? cached_channel_tail_idx + prefix : -1;
+                            send_head[(tile_base + lane_id) * kNumRanks + responsible_rank] =
+                                selected ? cached_channel_tail_idx + prefix : -1;
                         }
                     }
                     int available = __popc(selected_mask);
@@ -685,15 +680,15 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                     continue;
                 }
 
-                    if (write_head && token_idx % num_send_warps_per_rank == send_warp_id_in_rank && elect_one_sync())
-                        send_head[token_idx * kNumRanks + responsible_rank] = is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
-                    if (!is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
-                        token_idx++;
-                        continue;
-                    }
+                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank && elect_one_sync())
+                    send_head[token_idx * kNumRanks + responsible_rank] = is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
+                if (!is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
+                    token_idx++;
+                    continue;
+                }
 
                 const int ordinal = cached_channel_tail_idx++;
-                if (process_destination && cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank)
+                if (cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank)
                     copy_payload(token_idx, ordinal);
 
                 // Move token index
@@ -711,7 +706,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             // Move tail index
             // NOTES: here all warps should share the same new tail
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
-            if (process_destination && !local_destination) {
+            if (!local_destination) {
                 if (send_warp_id_in_rank == 0 and elect_one_sync())
                     st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
             }
@@ -1070,14 +1065,12 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         int send_rank_id = (responsible_channel + send_warp_id) % kNumRanks;
         int send_warp_id_in_rank = send_warp_id / kNumRanks;
         if constexpr (kSenderOnly) {
-          {
             const auto group = partition_remote_warp(send_warp_id,
-                num_send_warps,kNumRanks,rank,responsible_channel);
+                num_send_warps, kNumRanks, rank, responsible_channel);
             num_send_warps_per_rank = group.count;
             num_threads_per_rank = group.count * 32;
             send_rank_id = group.rank;
             send_warp_id_in_rank = send_warp_id - group.begin;
-          }
         }
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
@@ -1119,7 +1112,6 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
-            if (!local_destination) {
             if (elect_one_sync()) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
@@ -1135,7 +1127,6 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 }
             }
             __syncwarp();
-            }
 
             // Send by chunk
             #pragma unroll
@@ -1144,18 +1135,16 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 int dst_slot_idx = ring_slot(current_channel_tail_idx + i);
 
                 // Copy data
-                if (!local_destination) {
-                    auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
-                    auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
-                    UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
-                }
+                auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
+                auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
+                UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
 
                 // Send source index
-                if (!local_destination && elect_one_sync())
+                if (elect_one_sync())
                     channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + token_idx + i);
 
                 // Send `topk_weights`
-                if (!local_destination && num_topk > 0 and lane_id < num_topk)
+                if (num_topk > 0 and lane_id < num_topk)
                     channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
             }
             token_idx += num_round_tokens;
@@ -1163,7 +1152,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
             // Move tail index
             asm volatile("bar.sync %0, %1;" :: "r"(send_rank_id), "r"(num_threads_per_rank));
-            if (!local_destination && send_warp_id_in_rank == 0 && elect_one_sync())
+            if (send_warp_id_in_rank == 0 && elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
