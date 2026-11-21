@@ -12,3 +12,6 @@ build.failed.*/
 dist/
 *.egg-info/
 *.so
+
+# Generated from csrc/hybrid_ep/backend by setup.py.
+/deep_ep/backend/
