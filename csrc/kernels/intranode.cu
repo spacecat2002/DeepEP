@@ -923,7 +923,7 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
 }
 
 // A control-only collective: no payload allocation and no queue polling.
-template<int kNumRanks, bool kParallelHeads = false>
+template<int kNumRanks>
 __global__ void
 cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int,
                       int** barrier_signal_ptrs, int rank) {
@@ -958,29 +958,16 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
             int token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
-            if constexpr (kParallelHeads) {
-                // Reverse token order: the closest valid lane at or below the
-                // current lane is the next routed token. A ballot replaces the
-                // five-step inclusive shuffle scan while preserving carry.
-                const unsigned valid_heads = __ballot_sync(0xffffffff, current_head >= 0);
-                const unsigned through_lane = valid_heads & (0xffffffffu >> (31 - lane_id));
-                int previous_lane = -1;
-                if (through_lane) previous_lane = 31 - static_cast<int>(__clz(through_lane));
-                const int next_head = __shfl_sync(0xffffffff, current_head, max(0, previous_lane));
-                expected_head = -(previous_lane >= 0 ? next_head : last_head) - 1;
-                int carry_lane = -1;
-                if (valid_heads) carry_lane = 31 - static_cast<int>(__clz(valid_heads));
-                const int carry_head = __shfl_sync(0xffffffff, current_head, max(0, carry_lane));
-                if (carry_lane >= 0) last_head = carry_head;
-            } else for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++ i) {
-                const int head = __shfl_sync(0xffffffff, current_head, i);
-                if (head < 0) {
-                    if (lane_id == i)
-                        expected_head = -last_head - 1;
-                } else {
-                    last_head = head;
-                }
-            }
+            // In reverse token order, the nearest valid lower lane supplies the
+            // next routed head. Carry its value across groups of 32 tokens.
+            const unsigned valid_heads = __ballot_sync(0xffffffff, current_head >= 0);
+            const unsigned through_lane = valid_heads & (0xffffffffu >> (31 - lane_id));
+            const int previous_lane = 31 - __clz(through_lane);
+            const int next_head = __shfl_sync(0xffffffff, current_head, max(0, previous_lane));
+            expected_head = -(previous_lane >= 0 ? next_head : last_head) - 1;
+            const int carry_lane = 31 - __clz(valid_heads);
+            const int carry_head = __shfl_sync(0xffffffff, current_head, max(0, carry_lane));
+            if (carry_lane >= 0) last_head = carry_head;
             if (current_head < 0 and token_idx >= token_start_idx)
                 send_head[token_idx * kNumRanks + rank_id] = expected_head;
         }
@@ -992,12 +979,11 @@ void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
                            int** barrier_signal_ptrs, int rank, int num_ranks,
                            cudaStream_t stream) {
 #define CACHED_NOTIFY_COMBINE(ranks) { \
-    auto kernel = parallel_heads ? cached_notify_combine<ranks, true> : cached_notify_combine<ranks, false>; \
+    auto kernel = cached_notify_combine<ranks>; \
     LAUNCH_KERNEL(&cfg, kernel, \
         buffer_ptrs, send_head, num_channels, num_recv_tokens, num_memset_int, barrier_signal_ptrs, rank); \
     } break
 
-    const bool parallel_heads = optimized_fifo_enabled(num_ranks) && num_ranks == 4 && num_channels == 10;
     const int num_threads = std::max(128, 32 * num_ranks);
     EP_HOST_ASSERT(num_ranks <= num_threads);
     EP_HOST_ASSERT(num_threads <= 1024);
