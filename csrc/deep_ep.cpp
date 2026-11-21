@@ -509,6 +509,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
+    const bool fifo_optimized = deep_ep::optimized_fifo_enabled(num_ranks);
     if (cached_mode) {
         EP_HOST_ASSERT(cached_rank_prefix_matrix.has_value());
         EP_HOST_ASSERT(cached_channel_prefix_matrix.has_value());
@@ -660,7 +661,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         // These shapes depend only on sender/channel configuration. Allocate
         // while notify runs, before the host polls dynamic receive counts.
         // Keep payload allocations below count readiness as before.
-        if (deep_ep::optimized_fifo_enabled(num_ranks)) {
+        if (fifo_optimized) {
             recv_channel_prefix_matrix = torch::empty(
                 {num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
             if (!send_head.defined()) {
@@ -759,11 +760,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales +           // FP8 scale buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_sf_scales_for_nvfp4 // NVFP4 sf_scale buffer
                    <= num_nvl_bytes);
-    if (deep_ep::optimized_fifo_enabled(num_ranks))
+    if (fifo_optimized)
         EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
                         (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
     // FIFO is the sole transport switch; legacy split-path settings are ignored.
-    const bool parallel_local_remote = deep_ep::optimized_fifo_enabled(num_ranks) &&
+    const bool parallel_local_remote = fifo_optimized &&
         num_worst_tokens == 0;
     if (parallel_local_remote)
         stream_wait(local_stream, comm_stream);
@@ -823,6 +824,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
+    const bool fifo_optimized = deep_ep::optimized_fifo_enabled(num_ranks);
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_recv_tokens = static_cast<int>(send_head.size(0));
@@ -835,17 +837,15 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    const bool early_notify = deep_ep::optimized_fifo_enabled(num_ranks) && num_ranks == 4 && config.num_sms == 24 &&
-        async && previous_event.has_value();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
     // Wait previous tasks to be finished
-    if (!early_notify && previous_event.has_value()) {
+    if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else if (!early_notify) {
+    } else {
         stream_wait(comm_stream, compute_stream);
     }
 
@@ -865,7 +865,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    if (deep_ep::optimized_fifo_enabled(num_ranks))
+    if (fifo_optimized)
         EP_HOST_ASSERT((config.num_max_nvl_chunked_recv_tokens &
                         (config.num_max_nvl_chunked_recv_tokens - 1)) == 0);
     intranode::cached_notify_combine(buffer_ptrs_gpu, send_head.data_ptr<int>(),
@@ -897,12 +897,9 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                  // Source index buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)       // Top-k weight buffer
                    <= num_nvl_bytes);
-    const bool split = deep_ep::optimized_fifo_enabled(num_ranks);
     // Local contributions and the final ordered merge run independently of
     // the remote sender. Both kernels retain the bounded FIFO protocol.
-    if (early_notify)
-        stream_wait(comm_stream, previous_event.value());
-    if (split) stream_wait(local_stream, comm_stream);
+    if (fifo_optimized) stream_wait(local_stream, comm_stream);
     intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(), recv_topk_weights_ptr,
                        x.data_ptr(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1],
@@ -911,8 +908,8 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                        buffer_ptrs_gpu, rank, num_ranks,
                        comm_stream, config.num_sms,
                        config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
-                       split ? local_stream.stream() : nullptr);
-    if (split) stream_wait(comm_stream, local_stream);
+                       fifo_optimized ? local_stream.stream() : nullptr);
+    if (fifo_optimized) stream_wait(comm_stream, local_stream);
 
     // Wait streams
     std::optional<EventHandle> event;

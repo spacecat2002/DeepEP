@@ -259,8 +259,6 @@ class Buffer:
             config: the recommended config.
         """
 
-        if os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1" and num_ranks == 4:
-            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 6, 256, 6, 128)
         # TODO: automatically tune
         config_map = {
             2: Config(Buffer.num_sms, 24, 256, 6, 128),
@@ -289,8 +287,6 @@ class Buffer:
             config: the recommended config.
         """
 
-        if os.getenv("DEEPEP_FIFO_OPTIMIZED") == "1" and num_ranks == 4:
-            return Config(int(os.getenv("DEEPEP_FIFO_SMS", str(Buffer.num_sms))), 9, 256, 6, 128)
         # TODO: automatically tune
         config_map = {
             2: Config(Buffer.num_sms, 10, 256, 6, 128),
