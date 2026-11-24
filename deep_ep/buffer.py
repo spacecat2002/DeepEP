@@ -95,13 +95,14 @@ class Buffer:
             num_nvl_bytes = max(num_nvl_bytes, 128 * 1024 ** 2)
         else:
             num_nvl_bytes = max(num_nvl_bytes, 1984 * 1024 ** 2)
+        self.fifo_optimized = fifo_optimized
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.disable_nvlink_for_normal_mode = not allow_nvlink_for_normal_mode
         self.explicitly_destroy = explicitly_destroy
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, 
-                                          self.disable_nvlink_for_normal_mode,explicitly_destroy, use_fabric)
+                                          self.disable_nvlink_for_normal_mode, explicitly_destroy, use_fabric, fifo_optimized)
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()

@@ -62,7 +62,7 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
               void** buffer_ptrs, int rank, int num_ranks,
               cudaStream_t stream, int num_sms,
               int num_max_send_tokens, int num_recv_buffer_tokens,
-              cudaStream_t local_stream = nullptr);
+              bool fifo_optimized, cudaStream_t local_stream);
 
 void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int,
                            int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);

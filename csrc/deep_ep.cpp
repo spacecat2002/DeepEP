@@ -132,7 +132,8 @@ Buffer::Buffer(int rank,
                bool low_latency_mode,
                bool disable_nvlink_for_normal_mode,
                bool explicitly_destroy,
-               bool use_fabric)
+               bool use_fabric,
+               bool fifo_optimized)
     : rank(rank),
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
@@ -142,6 +143,7 @@ Buffer::Buffer(int rank,
       explicitly_destroy(explicitly_destroy),
       comm_stream(at::cuda::getStreamFromPool(true)),
       local_stream(at::cuda::getStreamFromPool(true)),
+      fifo_optimized(fifo_optimized),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -149,6 +151,8 @@ Buffer::Buffer(int rank,
     int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
 
     // Common checks
+    EP_HOST_ASSERT(!fifo_optimized || (!disable_nvlink_for_normal_mode &&
+                   (num_ranks == 2 || num_ranks == 4 || num_ranks == 8)));
     EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
     EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and (low_latency_mode or disable_nvlink_for_normal_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks and (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS or low_latency_mode or disable_nvlink_for_normal_mode));
@@ -498,7 +502,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
-    const bool fifo_optimized = deep_ep::optimized_fifo_enabled(num_ranks);
     if (cached_mode) {
         EP_HOST_ASSERT(cached_rank_prefix_matrix.has_value());
         EP_HOST_ASSERT(cached_channel_prefix_matrix.has_value());
@@ -764,7 +767,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride,
                         buffer_ptrs_gpu, rank, num_ranks, comm_stream, config.num_sms,
                         config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
-                        parallel_local_remote ? local_stream.stream() : nullptr);
+                        fifo_optimized, parallel_local_remote ? local_stream.stream() : nullptr);
 
     // The remote queue path is ordered on comm_stream.  Make its completion
     // event cover the independent local direct-copy path as well.
@@ -811,7 +814,6 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
-    const bool fifo_optimized = deep_ep::optimized_fifo_enabled(num_ranks);
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_recv_tokens = static_cast<int>(send_head.size(0));
@@ -2043,7 +2045,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)

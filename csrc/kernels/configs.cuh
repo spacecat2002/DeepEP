@@ -66,12 +66,3 @@ typedef uint8_t __nv_fp8_storage_t;
 #include <non_abi/device/threadgroup/nvshmemi_common_device_defines.cuh>
 #include <device_host_transport/nvshmem_common_ibgda.h>
 #endif
-
-namespace deep_ep {
-// The sole production transport selector. Shape and dtype safety remain automatic.
-inline bool optimized_fifo_enabled(int ranks) {
-    const char* value = std::getenv("DEEPEP_FIFO_OPTIMIZED");
-    return value && value[0] == '1' && value[1] == '\0' &&
-           (ranks == 2 || ranks == 4 || ranks == 8);
-}
-}  // namespace deep_ep

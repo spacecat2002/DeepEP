@@ -110,6 +110,8 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
+    const bool fifo_optimized;
+
     // Layout outputs are reused across normal-mode calls.  The mask storage
     // grows to the largest token batch seen by this Buffer and each call
     // returns a narrow view, so dynamic token counts remain exact.
@@ -127,7 +129,8 @@ public:
            bool low_latency_mode,
            bool disable_nvlink_for_normal_mode,
            bool explicitly_destroy,
-           bool use_fabric);
+           bool use_fabric,
+           bool fifo_optimized);
 
     ~Buffer() noexcept(false);
 

@@ -477,8 +477,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     // Keep the existing per-warp shared-memory slice. A whole row avoids
     // a second TMA load/wait/store when it fits; larger rows retain two parts.
-    const int tma_parts = kCompactTma ? 1 : kOptimized &&
-        static_cast<int64_t>(hidden_int4) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp ? 1 : 2;
+    constexpr int tma_parts = kCompactTma ? 1 : 2;
     const int half_hidden_int4 = hidden_int4 / tma_parts;
     const int half_hidden_bytes = half_hidden_int4 * static_cast<int>(sizeof(int4));
     auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
@@ -550,10 +549,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 : channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
             auto shifted_x = x + token_idx * hidden_int4;
 #ifndef DISABLE_SM90_FEATURES
-            if constexpr (kOptimized) {
-                if constexpr (kCompactTma && kUseTMA) {
-                // This specialization is selected only when the full row fits
-                // the existing warp slice; larger rows use the generic copy.
+            if constexpr (kCompactTma) {
                 tma_store_wait<0>();
                 if (elect_one_sync()) {
                     tma_load_1d(tma_buffer, shifted_x, tma_mbarrier, half_hidden_bytes);
@@ -562,12 +558,9 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                     tma_store_1d(tma_buffer, shifted_channel_x_buffers, half_hidden_bytes, false);
                 }
                 __syncwarp();
-                } else
+            } else
 #endif
-                {
-                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
-                }
-            } else {
+            {
                 UNROLLED_WARP_COPY(5, lane_id, hidden_int4,
                                    shifted_channel_x_buffers, shifted_x,
                                    __ldg, st_na_global);
@@ -871,12 +864,11 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
               int scale_token_stride, int scale_hidden_stride, int sf_scale_for_nvfp4_token_stride, int sf_scale_for_nvfp4_hidden_stride,
               void** buffer_ptrs, int rank, int num_ranks,
               cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens,
-              cudaStream_t local_stream) {
+              bool fifo_optimized, cudaStream_t local_stream) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 8192;
     const bool use_tma = hidden_int4 % 2 == 0 &&
         static_cast<int64_t>(hidden_int4 / 2) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp;
-    const bool fifo_optimized = optimized_fifo_enabled(num_ranks);
     const bool compact_tma_shape = use_tma &&
         static_cast<int64_t>(hidden_int4) * sizeof(int4) + sizeof(uint64_t) <= kNumTMABytesPerWarp;
 
@@ -889,7 +881,7 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
     EP_HOST_ASSERT(static_cast<int64_t>(num_sf_scales_for_nvfp4) * sf_scale_for_nvfp4_hidden_stride < std::numeric_limits<int>::max());
 
 #define DISPATCH_LAUNCH_CASE(ranks) { \
-    if (local_stream != nullptr && fifo_optimized) { \
+    if (local_stream != nullptr) { \
         launch_payload(select_dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, DispatchPath::Local>(use_tma, compact_tma_shape), local_stream); \
         launch_payload(select_dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, DispatchPath::Remote>(use_tma, compact_tma_shape), stream); \
     } else if (fifo_optimized) { \
@@ -906,7 +898,11 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
     if (local_stream != nullptr) attr[0].val.cooperative = 0;
 #endif
     auto launch_payload = [&](auto kernel, cudaStream_t launch_stream) {
+#ifndef DISABLE_SM90_FEATURES
         cfg.stream = launch_stream;
+#else
+        __stream = launch_stream;
+#endif
         SET_SHARED_MEMORY_FOR_TMA(kernel);
         LAUNCH_KERNEL(&cfg, kernel,
             reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4,
@@ -1011,8 +1007,6 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
     const auto sm_id = static_cast<int>(blockIdx.x) * (kOptimized ? 2 : 1) + (kReceiverOnly), lane_id = get_lane_id();
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
-    if constexpr (kSenderOnly) { if (!is_sender) return; }
-    if constexpr (kReceiverOnly) { if (is_sender) return; }
     const int responsible_channel = sm_id / 2;
     const bool recv_buffer_is_power_of_two =
         (num_recv_buffer_tokens & (num_recv_buffer_tokens - 1)) == 0;
@@ -1440,7 +1434,7 @@ void combine(cudaDataType_t type,
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 4096;
     const bool no_bias_fast = bias_0 == nullptr && bias_1 == nullptr;
-    const bool split = optimized_fifo_enabled(num_ranks) && local_stream != nullptr;
+    const bool split = local_stream != nullptr;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
@@ -1454,12 +1448,12 @@ void combine(cudaDataType_t type,
         /* Resolve both kernels before the sender can block on FIFO progress. */ \
         SET_SHARED_MEMORY_FOR_TMA(receiver); \
         SET_SHARED_MEMORY_FOR_TMA(sender); \
-        launch_payload(sender, stream, true); \
-        launch_payload(receiver, local_stream, true); \
+        launch_payload(sender, stream); \
+        launch_payload(receiver, local_stream); \
     } else { \
         auto kernel = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>; \
         SET_SHARED_MEMORY_FOR_TMA(kernel); \
-        launch_payload(kernel, stream, false); \
+        launch_payload(kernel, stream); \
     } \
 } break
 #define COMBINE_DTYPE_LAUNCH_CASE(dtype) SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE); break
@@ -1477,9 +1471,14 @@ void combine(cudaDataType_t type,
         cfg.gridDim.x = num_sms / 2;
     }
 #endif
-    auto launch_payload = [&](auto kernel, cudaStream_t launch_stream, bool fifo) {
+    auto launch_payload = [&](auto kernel, cudaStream_t launch_stream) {
+#ifndef DISABLE_SM90_FEATURES
         cfg.stream = launch_stream;
-        if (fifo) cfg.dynamicSmemBytes = 0;
+        if (split) cfg.dynamicSmemBytes = 0;
+#else
+        __stream = launch_stream;
+        __num_sms = split ? num_sms / 2 : num_sms;
+#endif
         using Dtype = typename KernelScalar<decltype(kernel)>::type;
         LAUNCH_KERNEL(&cfg, kernel,
             reinterpret_cast<Dtype*>(recv_x), recv_topk_weights,
