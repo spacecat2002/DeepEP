@@ -1054,12 +1054,6 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
 
-        const bool local_destination = kOptimized && send_rank_id == rank;
-        // Local rows are read directly by the receiver during reduction. The
-        // local sender group has no queue, payload, or tail update to perform.
-        if (local_destination)
-            return;
-
         // Calculate pointers by the specific layout
         auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
         auto num_channels_total = num_channels * kNumRanks;
@@ -1493,8 +1487,6 @@ void combine(cudaDataType_t type,
 #undef COMBINE_LAUNCH_CASE
 }
 
-// Push each remote contribution into its origin's shared buffer. The origin
-// reduces local HBM reads; local contributions bypass staging entirely.
 } // namespace intranode
 
 } // namespace deep_ep
